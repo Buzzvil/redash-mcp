@@ -1,7 +1,7 @@
 import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import * as dotenv from 'dotenv';
 import { SocksProxyAgent } from 'socks-proxy-agent';
-import { AuthError, ensureValidTokens, forceRefresh, performLogout } from './auth.js';
+import { AuthError, forceRefresh, getValidTokens } from './auth.js';
 import { logger } from './logger.js';
 
 dotenv.config();
@@ -308,11 +308,13 @@ export class RedashClient {
     }
 
     // Attach the current OIDC access token to every outbound request. The
-    // token store handles refresh near expiry; we additionally retry once on
-    // 401 in case the IdP rotated/revoked the token sooner than its stated
-    // expiry.
+    // tool dispatcher in index.ts is responsible for surfacing login prompts
+    // before reaching here; by this point a cached token should exist (or
+    // getValidTokens throws AuthError which bubbles up as a fatal error).
+    // We additionally retry once on 401 in case the IdP rotated/revoked the
+    // token sooner than its stated expiry — forceRefresh handles that path.
     this.client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
-      const tokens = await ensureValidTokens();
+      const tokens = await getValidTokens();
       config.headers = config.headers ?? {};
       (config.headers as any).set?.('Authorization', `Bearer ${tokens.accessToken}`)
         ?? ((config.headers as any).Authorization = `Bearer ${tokens.accessToken}`);
@@ -324,20 +326,19 @@ export class RedashClient {
       const cfg = error.config;
       if (status === 401 && cfg && !cfg._retried) {
         cfg._retried = true;
-        let refreshed;
         try {
-          refreshed = await forceRefresh();
+          const refreshed = await forceRefresh();
+          cfg.headers = cfg.headers ?? {};
+          (cfg.headers as any).set?.('Authorization', `Bearer ${refreshed.accessToken}`)
+            ?? ((cfg.headers as any).Authorization = `Bearer ${refreshed.accessToken}`);
+          return this.client.request(cfg);
         } catch (refreshErr) {
-          if (!(refreshErr instanceof AuthError)) throw refreshErr;
-          // Refresh failed (revoked / no refresh_token). Clear stale cache so
-          // ensureValidTokens triggers a fresh interactive login.
-          await performLogout().catch(() => {});
-          refreshed = await ensureValidTokens();
+          // Refresh failed (no refresh_token / revoked). Surface as AuthError
+          // so the tool dispatcher can prompt the user to log in again — do
+          // not auto-relaunch a browser flow here.
+          if (refreshErr instanceof AuthError) throw refreshErr;
+          throw refreshErr;
         }
-        cfg.headers = cfg.headers ?? {};
-        (cfg.headers as any).set?.('Authorization', `Bearer ${refreshed.accessToken}`)
-          ?? ((cfg.headers as any).Authorization = `Bearer ${refreshed.accessToken}`);
-        return this.client.request(cfg);
       }
       throw error;
     });

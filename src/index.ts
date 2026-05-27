@@ -18,6 +18,7 @@ import { buildParameterizedExecutionParameters, ParameterizedExecutionError } fr
 import { mergeDeep } from "./utils.js";
 import { buildWidgetLayoutOptions, dashboardGridDefaults, summarizeWidgetLayout, widgetLayoutEntrySchema, widgetPositionSchema } from "./widgetLayout.js";
 import { logger, LogLevel } from "./logger.js";
+import { AuthError } from "./auth.js";
 
 // Load environment variables
 dotenv.config();
@@ -2479,6 +2480,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   logger.debug(`Tool request received: ${name} with args: ${JSON.stringify(args)}`);
+
+  // Gate every tool call on a valid OIDC token. If the cache is missing /
+  // expired-without-refresh, ensureValidTokens starts a non-interactive
+  // login flow (loopback callback server, no browser spawn) and throws an
+  // AuthError whose message contains the auth URL. We surface that URL via
+  // the tool response so the host (Claude Desktop / Claude Code) can show
+  // it to the user — they click, complete PKCE in their browser, the
+  // loopback server picks up the callback, and the next tool call succeeds.
+  try {
+    const { ensureValidTokens } = await import('./auth.js');
+    await ensureValidTokens();
+  } catch (authErr) {
+    if (authErr instanceof AuthError) {
+      logger.info(`Auth required for ${name}; surfacing login URL via tool response`);
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: authErr.message,
+        }],
+      };
+    }
+    throw authErr;
+  }
 
   try {
     // First perform type checking for early validation to catch errors when the provided schema doesn't match expectations

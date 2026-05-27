@@ -270,7 +270,19 @@ function tokenResponseToCached(resp: TokenResponse, cfg: OidcConfig, fallbackRef
  * Run the full PKCE login flow: open browser, wait for callback, exchange
  * code, persist tokens. Intended to be invoked from `redash-mcp login`.
  */
-export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
+interface LoginFlowHandle {
+  url: string;
+  completion: Promise<CachedTokens>;
+}
+
+/**
+ * Start a PKCE login flow: spin up the loopback callback server, build the
+ * auth URL, and return both immediately. The caller decides how to surface
+ * the URL (auto-launch browser in a terminal, return it via tool response in
+ * an MCP context, etc.) and may await `completion` to receive the cached
+ * tokens once the callback arrives.
+ */
+async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
   const cfg = opts.cfg ?? loadOidcConfig();
   const cache = opts.cachePath ?? tokenCachePath();
   const timeoutMs = opts.timeoutMs ?? 5 * 60_000;
@@ -279,8 +291,6 @@ export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string;
   const { verifier, challenge } = generatePkcePair();
   const state = base64UrlEncode(crypto.randomBytes(16));
 
-  // We need the port before we can build the auth URL, so spin the server
-  // up first, then build the URL, then open the browser.
   const server = http.createServer();
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -340,27 +350,76 @@ export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string;
   authUrl.searchParams.set('code_challenge', challenge);
   authUrl.searchParams.set('code_challenge_method', 'S256');
 
-  // Print first so the user can copy if the browser fails to open.
-  process.stderr.write(`\nOpen this URL in your browser if it doesn't open automatically:\n  ${authUrl.toString()}\n\n`);
-  openBrowser(authUrl.toString());
+  const completion = (async () => {
+    try {
+      const callback = await callbackPromise;
+      const tokens = await exchangeCodeForTokens(discovery.token_endpoint, {
+        code: callback.code,
+        clientId: cfg.clientId,
+        redirectUri,
+        codeVerifier: verifier,
+      });
+      const cached = tokenResponseToCached(tokens, cfg);
+      await writeTokenCache(cache, cached);
+      return cached;
+    } finally {
+      try { server.close(); } catch { /* ignore */ }
+    }
+  })();
 
-  let callback: CallbackResult;
-  try {
-    callback = await callbackPromise;
-  } finally {
-    try { server.close(); } catch { /* ignore */ }
+  return { url: authUrl.toString(), completion };
+}
+
+/**
+ * Run the full PKCE login flow: open browser, wait for callback, exchange
+ * code, persist tokens. Intended to be invoked from `redash-mcp login`
+ * (interactive terminal). For the MCP server path see `startPendingLogin`.
+ */
+export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
+  const { url, completion } = await beginLoginFlow(opts);
+  process.stderr.write(`\nOpen this URL in your browser if it doesn't open automatically:\n  ${url}\n\n`);
+  openBrowser(url);
+  return completion;
+}
+
+interface PendingLogin {
+  url: string;
+  completion: Promise<CachedTokens>;
+  startedAt: number;
+}
+
+let pendingLogin: PendingLogin | null = null;
+const PENDING_LOGIN_TTL_MS = 5 * 60_000;
+
+/**
+ * Start (or attach to) a non-interactive PKCE login. The loopback callback
+ * server is started but the browser is NOT auto-launched — the caller surfaces
+ * the returned URL to a user-facing channel (MCP tool response) and the user
+ * clicks/pastes it themselves. Returns immediately with the URL.
+ *
+ * Concurrent callers share one in-flight login. Once the callback arrives the
+ * tokens are cached and `pendingLogin` is cleared so subsequent failures start
+ * a fresh flow.
+ */
+export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ url: string }> {
+  if (pendingLogin && Date.now() - pendingLogin.startedAt < PENDING_LOGIN_TTL_MS) {
+    return { url: pendingLogin.url };
   }
 
-  const tokens = await exchangeCodeForTokens(discovery.token_endpoint, {
-    code: callback.code,
-    clientId: cfg.clientId,
-    redirectUri,
-    codeVerifier: verifier,
-  });
+  const { url, completion } = await beginLoginFlow(opts);
+  const handle: PendingLogin = {
+    url,
+    completion,
+    startedAt: Date.now(),
+  };
+  pendingLogin = handle;
+  // Clear pendingLogin once the flow resolves either way so a fresh attempt
+  // can start on the next failure.
+  completion.finally(() => {
+    if (pendingLogin === handle) pendingLogin = null;
+  }).catch(() => { /* errors surface via the next ensureValidTokens call */ });
 
-  const cached = tokenResponseToCached(tokens, cfg);
-  await writeTokenCache(cache, cached);
-  return cached;
+  return { url };
 }
 
 /**
@@ -429,25 +488,27 @@ export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string 
 }
 
 /**
- * Like getValidTokens, but on cache miss / unrecoverable AuthError triggers
- * an interactive PKCE login (spawns the browser, blocks until the user
- * completes the flow). Concurrent callers share one in-flight login.
+ * Like getValidTokens, but on cache miss / unrecoverable AuthError starts a
+ * non-interactive login flow (loopback server only — no browser spawn) and
+ * throws an AuthError whose message contains the auth URL. The caller is
+ * expected to surface that URL to the user via a tool response; once the
+ * user completes PKCE in their browser, the loopback server receives the
+ * callback and the next call to this function succeeds.
  *
- * Intended for the MCP `serve` path where we don't want to require a
- * pre-flight `redash-mcp login`: the first tool call simply opens the
- * browser and waits for the user.
+ * Why not auto-launch the browser: the MCP server typically runs as a stdio
+ * subprocess (Claude Desktop / IDE) or in a container without `xdg-open`. A
+ * silent browser spawn is invisible to the user; an explicit URL surfaced
+ * through the tool response is universally actionable.
  */
-let activeLogin: Promise<CachedTokens> | null = null;
 export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
   try {
     return await getValidTokens(opts);
   } catch (err) {
     if (!(err instanceof AuthError)) throw err;
-    if (!activeLogin) {
-      process.stderr.write(`[redash-mcp] ${err.message}\n[redash-mcp] Launching browser for OIDC PKCE login...\n`);
-      activeLogin = performLogin(opts).finally(() => { activeLogin = null; });
-    }
-    return await activeLogin;
+    const { url } = await startPendingLogin(opts);
+    throw new AuthError(
+      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${url}\n\nAfter completing the browser flow, retry the tool call.`,
+    );
   }
 }
 
