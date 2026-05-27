@@ -2204,6 +2204,10 @@ const updateAlertSchemaDescriptions = {
 } satisfies JsonSchemaDescriptionMap;
 
 const toolDefinitions = [
+  defineTool(
+    "wait_for_oidc_login",
+    "Block until the user completes the in-flight OIDC device authorization flow. Call this immediately after surfacing the verification URL to the user (you receive that URL inside the error message of any other tool when authorization is needed). Returns once tokens are cached, then you can retry the original tool. Returns an error if the device code expires before the user completes the flow.",
+  ),
   defineTool("list_queries", "List all available queries in Redash", listQueriesSchema, {
     ...paginationSchemaDescriptions,
     q: "Search query",
@@ -2481,13 +2485,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   logger.debug(`Tool request received: ${name} with args: ${JSON.stringify(args)}`);
 
-  // Gate every tool call on a valid OIDC token. If the cache is missing /
-  // expired-without-refresh, ensureValidTokens starts a non-interactive
-  // login flow (loopback callback server, no browser spawn) and throws an
-  // AuthError whose message contains the auth URL. We surface that URL via
-  // the tool response so the host (Claude Desktop / Claude Code) can show
-  // it to the user — they click, complete PKCE in their browser, the
-  // loopback server picks up the callback, and the next tool call succeeds.
+  // `wait_for_oidc_login` is the auth completion gate itself, so it must
+  // bypass the auth pre-check below — calling it is how you authenticate.
+  if (name === "wait_for_oidc_login") {
+    try {
+      const { waitForPendingLogin, readStatus } = await import('./auth.js');
+      await waitForPendingLogin();
+      const status = await readStatus();
+      const who = status.email ? ` as ${status.email}` : '';
+      return {
+        content: [{
+          type: "text",
+          text: `Authenticated successfully${who}. Retry the original tool call now.`,
+        }],
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: `OIDC login did not complete: ${msg}`,
+        }],
+      };
+    }
+  }
+
+  // Gate every other tool call on a valid OIDC token. On cache miss
+  // ensureValidTokens starts a device flow in the background and throws an
+  // AuthError whose message tells both the user and the assistant what to
+  // do next (open URL + call `wait_for_oidc_login`).
   try {
     const { ensureValidTokens } = await import('./auth.js');
     await ensureValidTokens();

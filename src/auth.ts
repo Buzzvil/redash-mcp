@@ -363,6 +363,48 @@ export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: st
 }
 
 /**
+ * Block until the currently-pending login (or a freshly-started one) finishes.
+ * Used by the `wait_for_oidc_login` MCP tool so the assistant can call it
+ * after surfacing the verification URL to the user; once the user completes
+ * device authorization in their browser, this resolves with the cached
+ * tokens and the assistant can immediately retry the original tool.
+ *
+ * If tokens are already valid, returns immediately without starting a new
+ * flow. If no pending flow exists, starts one.
+ */
+export async function waitForPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
+  try {
+    return await getValidTokens(opts);
+  } catch (err) {
+    if (!(err instanceof AuthError)) throw err;
+  }
+
+  if (!pendingLogin || pendingLogin.expiresAt <= Date.now()) {
+    await startPendingLogin(opts);
+  }
+  const pl = pendingLogin!;
+  const hardDeadline = pl.expiresAt - Date.now() + 5_000; // device code expiry + small slack
+  const timeoutMs = Math.max(0, Math.min(opts.timeoutMs ?? hardDeadline, hardDeadline));
+
+  return await Promise.race([
+    pl.completion,
+    new Promise<CachedTokens>((_, reject) =>
+      setTimeout(() => reject(new AuthError('Timed out waiting for OIDC login. Have the user re-open the verification URL and try again.')), timeoutMs),
+    ),
+  ]);
+}
+
+/**
+ * Snapshot of the currently-pending login flow, or null if none is in
+ * progress. Used by the MCP server to advertise the verification URL on
+ * follow-up tool calls without restarting the flow.
+ */
+export function getPendingLogin(): { url: string; userCode: string; expiresAt: number } | null {
+  if (!pendingLogin || pendingLogin.expiresAt <= Date.now()) return null;
+  return { url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
+}
+
+/**
  * Read the cached tokens and refresh if near expiry. Throws AuthError if no
  * usable cache exists.
  */
@@ -441,9 +483,14 @@ export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: st
     if (!(err instanceof AuthError)) throw err;
     const pending = await startPendingLogin(opts);
     throw new AuthError(
-      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${pending.url}\n\n` +
+      `Authorization required to access Redash.\n\n` +
+      `## For the user\n` +
+      `Open this URL in your browser to authorize:\n  ${pending.url}\n` +
       `If the page asks for a code, enter: ${pending.userCode}\n\n` +
-      `After completing the browser flow, retry the tool call.`,
+      `## For the assistant\n` +
+      `In this same response: surface the URL above to the user, then immediately call the \`wait_for_oidc_login\` tool. ` +
+      `It will block until the user finishes the browser flow (or the device code expires). ` +
+      `Once it returns successfully, retry the original tool call — do not ask the user for confirmation in between.`,
     );
   }
 }
