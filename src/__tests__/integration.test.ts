@@ -7,21 +7,41 @@
 
 // Set environment variables before any imports
 process.env.REDASH_URL = 'https://redash.example.com';
-process.env.REDASH_API_KEY = 'test-api-key';
+process.env.REDASH_OIDC_ISSUER = 'https://idp.example.com';
+process.env.REDASH_OIDC_CLIENT_ID = 'redash-cli';
 process.env.REDASH_TIMEOUT = '30000';
 
-import { redashClient } from '../redashClient.js';
-import { logger } from '../logger.js';
 import { jest } from '@jest/globals';
+
+// Mock auth so the singleton redashClient (imported below) doesn't try to
+// hit the IdP or read a real token cache.
+jest.mock('../auth.js', () => ({
+  AuthError: class AuthError extends Error {},
+  getValidTokens: jest.fn<any>().mockResolvedValue({
+    accessToken: 'test-access-token',
+    expiresAt: Date.now() + 60_000,
+    issuer: 'https://idp.example.com',
+    clientId: 'redash-cli',
+  }),
+  forceRefresh: jest.fn<any>().mockResolvedValue({
+    accessToken: 'refreshed-access-token',
+    expiresAt: Date.now() + 60_000,
+    issuer: 'https://idp.example.com',
+    clientId: 'redash-cli',
+  }),
+}));
 
 // Mock axios to avoid real API calls
 jest.mock('axios');
 
+import { redashClient } from '../redashClient.js';
+import { logger } from '../logger.js';
+
 describe('MCP Server Integration', () => {
   beforeEach(() => {
-    // Set up environment variables for testing
     process.env.REDASH_URL = 'https://redash.example.com';
-    process.env.REDASH_API_KEY = 'test-api-key';
+    process.env.REDASH_OIDC_ISSUER = 'https://idp.example.com';
+    process.env.REDASH_OIDC_CLIENT_ID = 'redash-cli';
   });
 
   describe('redashClient and logger integration', () => {
@@ -36,6 +56,10 @@ describe('MCP Server Integration', () => {
         const mockInstance = {
           get: jest.fn<any>().mockRejectedValue(new Error('Network error')),
           defaults: { headers: {} },
+          interceptors: {
+            request: { use: jest.fn() },
+            response: { use: jest.fn() },
+          },
         };
         mockedAxios.create.mockReturnValue(mockInstance as any);
       }
@@ -52,23 +76,16 @@ describe('MCP Server Integration', () => {
   });
 
   describe('Environment configuration', () => {
-    it('should require REDASH_URL and REDASH_API_KEY', () => {
+    it('should require REDASH_URL', () => {
       const originalUrl = process.env.REDASH_URL;
-      const originalKey = process.env.REDASH_API_KEY;
-
       delete process.env.REDASH_URL;
-      delete process.env.REDASH_API_KEY;
 
-      // This should be tested in RedashClient constructor
       expect(() => {
-        // Constructor is called when importing, so we need to re-import
         const { RedashClient } = require('../redashClient.js');
         new RedashClient();
-      }).toThrow();
+      }).toThrow('REDASH_URL');
 
-      // Restore
       process.env.REDASH_URL = originalUrl;
-      process.env.REDASH_API_KEY = originalKey;
     });
   });
 

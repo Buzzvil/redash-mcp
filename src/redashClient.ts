@@ -1,6 +1,7 @@
-import axios, { AxiosInstance, AxiosError } from 'axios';
+import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import * as dotenv from 'dotenv';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { AuthError, forceRefresh, getValidTokens } from './auth.js';
 import { logger } from './logger.js';
 
 dotenv.config();
@@ -263,24 +264,18 @@ export interface RedashDestination {
 export class RedashClient {
   private client: AxiosInstance;
   private baseUrl: string;
-  private apiKey: string;
 
   constructor() {
     this.baseUrl = process.env.REDASH_URL || '';
-    this.apiKey = process.env.REDASH_API_KEY || '';
 
-    if (!this.baseUrl || !this.apiKey) {
-      throw new Error('REDASH_URL and REDASH_API_KEY must be provided in .env file');
+    if (!this.baseUrl) {
+      throw new Error('REDASH_URL must be set in the environment');
     }
-
-    const defaultHeaders: Record<string, string> = {
-      'Authorization': `Key ${this.apiKey}`,
-      'Content-Type': 'application/json'
-    };
 
     const extraHeaders = this.parseExtraHeaders();
 
-    // Prevent accidental override of Authorization header
+    // The Authorization header is injected per-request from the OIDC token
+    // cache; reject any caller attempt to override it via REDASH_EXTRA_HEADERS.
     if (extraHeaders['Authorization'] || extraHeaders['authorization']) {
       delete extraHeaders['Authorization'];
       delete extraHeaders['authorization'];
@@ -289,7 +284,7 @@ export class RedashClient {
     const axiosConfig: Record<string, unknown> = {
       baseURL: this.baseUrl,
       headers: {
-        ...defaultHeaders,
+        'Content-Type': 'application/json',
         ...extraHeaders,
       },
       timeout: parseInt(process.env.REDASH_TIMEOUT || '30000')
@@ -303,6 +298,47 @@ export class RedashClient {
     }
 
     this.client = axios.create(axiosConfig);
+
+    // Guard against the jest auto-mock case where axios.create() returns
+    // undefined (happens for the module-load singleton before tests install
+    // their own mockReturnValue). Tests that exercise the client install a
+    // proper mock first, so they get the interceptors.
+    if (!this.client?.interceptors) {
+      return;
+    }
+
+    // Attach the current OIDC access token to every outbound request. The
+    // token store handles refresh near expiry; we additionally retry once on
+    // 401 in case the IdP rotated/revoked the token sooner than its stated
+    // expiry.
+    this.client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
+      const tokens = await getValidTokens();
+      config.headers = config.headers ?? {};
+      (config.headers as any).set?.('Authorization', `Bearer ${tokens.accessToken}`)
+        ?? ((config.headers as any).Authorization = `Bearer ${tokens.accessToken}`);
+      return config;
+    });
+
+    this.client.interceptors.response.use(undefined, async (error: AxiosError & { config?: InternalAxiosRequestConfig & { _retried?: boolean } }) => {
+      const status = error.response?.status;
+      const cfg = error.config;
+      if (status === 401 && cfg && !cfg._retried) {
+        cfg._retried = true;
+        try {
+          const refreshed = await forceRefresh();
+          cfg.headers = cfg.headers ?? {};
+          (cfg.headers as any).set?.('Authorization', `Bearer ${refreshed.accessToken}`)
+            ?? ((cfg.headers as any).Authorization = `Bearer ${refreshed.accessToken}`);
+          return this.client.request(cfg);
+        } catch (refreshErr) {
+          if (refreshErr instanceof AuthError) {
+            throw new Error(`${refreshErr.message} (Redash returned 401)`);
+          }
+          throw refreshErr;
+        }
+      }
+      throw error;
+    });
   }
 
   // Parse extra headers from env var `REDASH_EXTRA_HEADERS`.

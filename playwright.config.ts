@@ -1,8 +1,12 @@
 import { defineConfig, devices } from '@playwright/test';
 
-// Test environment defaults
+// Test environment defaults. The MCP server now uses OIDC; e2e expects a
+// pre-existing token cache at REDASH_OIDC_TOKEN_CACHE_PATH (writable by the
+// test runner) and the same issuer/client id that was used to mint it.
 const TEST_REDASH_URL = process.env.REDASH_URL || 'https://demo.redash.io';
-const TEST_REDASH_API_KEY = process.env.REDASH_API_KEY || 'test_api_key';
+const TEST_OIDC_ISSUER = process.env.REDASH_OIDC_ISSUER || 'https://idp.example.com';
+const TEST_OIDC_CLIENT_ID = process.env.REDASH_OIDC_CLIENT_ID || 'redash-cli';
+const TEST_OIDC_TOKEN_CACHE_PATH = process.env.REDASH_OIDC_TOKEN_CACHE_PATH || '';
 
 export default defineConfig({
   testDir: './e2e',
@@ -30,7 +34,14 @@ export default defineConfig({
   ],
 
   webServer: process.env.SKIP_WEBSERVER ? undefined : {
-    command: `REDASH_URL=${TEST_REDASH_URL} REDASH_API_KEY=${TEST_REDASH_API_KEY} DANGEROUSLY_OMIT_AUTH=true npm run inspector`,
+    command: [
+      `REDASH_URL=${TEST_REDASH_URL}`,
+      `REDASH_OIDC_ISSUER=${TEST_OIDC_ISSUER}`,
+      `REDASH_OIDC_CLIENT_ID=${TEST_OIDC_CLIENT_ID}`,
+      TEST_OIDC_TOKEN_CACHE_PATH ? `REDASH_OIDC_TOKEN_CACHE_PATH=${TEST_OIDC_TOKEN_CACHE_PATH}` : '',
+      'DANGEROUSLY_OMIT_AUTH=true',
+      'npm run inspector',
+    ].filter(Boolean).join(' '),
     url: 'http://localhost:6274',
     reuseExistingServer: !process.env.CI,
     timeout: 120000,
