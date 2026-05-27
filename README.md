@@ -77,7 +77,7 @@ a browser — instead, it reads the cached tokens left behind by
    ```
 3. Create a `.env` file with your Redash + OIDC configuration:
    ```env
-   REDASH_URL=https://redash-dev.buzzvil.com
+   REDASH_URL=https://redash-dev.buzzvil.dev
    REDASH_OIDC_ISSUER=https://authentik.buzzvil.com/application/o/redash-cli/
    REDASH_OIDC_CLIENT_ID=redash-cli
    REDASH_OIDC_AUDIENCE=redash-cli
