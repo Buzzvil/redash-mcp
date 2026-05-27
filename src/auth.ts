@@ -428,6 +428,29 @@ export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string 
   return updated;
 }
 
+/**
+ * Like getValidTokens, but on cache miss / unrecoverable AuthError triggers
+ * an interactive PKCE login (spawns the browser, blocks until the user
+ * completes the flow). Concurrent callers share one in-flight login.
+ *
+ * Intended for the MCP `serve` path where we don't want to require a
+ * pre-flight `redash-mcp login`: the first tool call simply opens the
+ * browser and waits for the user.
+ */
+let activeLogin: Promise<CachedTokens> | null = null;
+export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
+  try {
+    return await getValidTokens(opts);
+  } catch (err) {
+    if (!(err instanceof AuthError)) throw err;
+    if (!activeLogin) {
+      process.stderr.write(`[redash-mcp] ${err.message}\n[redash-mcp] Launching browser for OIDC PKCE login...\n`);
+      activeLogin = performLogin(opts).finally(() => { activeLogin = null; });
+    }
+    return await activeLogin;
+  }
+}
+
 export async function performLogout(opts: { cachePath?: string } = {}): Promise<void> {
   await clearTokenCache(opts.cachePath ?? tokenCachePath());
 }

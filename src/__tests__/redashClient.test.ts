@@ -24,12 +24,19 @@ jest.mock('../auth.js', () => ({
     issuer: 'https://idp.example.com',
     clientId: 'redash-cli',
   }),
+  ensureValidTokens: jest.fn<any>().mockResolvedValue({
+    accessToken: 'test-access-token',
+    expiresAt: Date.now() + 60_000,
+    issuer: 'https://idp.example.com',
+    clientId: 'redash-cli',
+  }),
   forceRefresh: jest.fn<any>().mockResolvedValue({
     accessToken: 'refreshed-access-token',
     expiresAt: Date.now() + 60_000,
     issuer: 'https://idp.example.com',
     clientId: 'redash-cli',
   }),
+  performLogout: jest.fn<any>().mockResolvedValue(undefined),
 }));
 
 // Mock logger

@@ -76,17 +76,16 @@ async function runStatus(): Promise<void> {
 
 async function runServer(): Promise<void> {
   requireServerEnv();
-  // Verify a usable token exists before starting the MCP server so the user
-  // sees a clear "run `login`" message instead of cryptic API failures later.
-  const { getValidTokens, AuthError } = await import('./auth.js');
+  // Ensure a usable token exists before binding stdio. If the cache is
+  // missing/expired-without-refresh, ensureValidTokens transparently runs the
+  // PKCE browser flow now — that keeps the "no explicit login step" UX for
+  // plugin users at the cost of a one-time browser popup on first use.
+  const { ensureValidTokens } = await import('./auth.js');
   try {
-    await getValidTokens();
+    await ensureValidTokens();
   } catch (err: any) {
-    if (err instanceof AuthError) {
-      process.stderr.write(`${err.message}\n`);
-      process.exit(1);
-    }
-    throw err;
+    process.stderr.write(`Fatal: failed to obtain OIDC tokens: ${err?.message || err}\n`);
+    process.exit(1);
   }
   await import('./index.js');
 }
