@@ -1,22 +1,24 @@
 /**
- * OIDC + PKCE browser login for the Redash MCP server.
+ * OIDC Device Authorization Grant (RFC 8628) login for the Redash MCP server.
  *
- * Why a separate `login` subcommand instead of starting the flow inside the
- * MCP server itself: the MCP server runs as a stdio subprocess of Claude
- * Desktop (or similar), so it has no way to interactively open a browser and
- * receive the user's attention. The user runs `redash-mcp login` once in
- * their terminal; the MCP server consumes the cached tokens silently and
- * refreshes them when needed.
+ * Why device flow only: the MCP server typically runs as a stdio subprocess of
+ * Claude Desktop / Claude Code (often in a container, often without a
+ * reachable browser). PKCE + loopback redirect needs (a) a browser the user
+ * can see, (b) the user's browser to be able to reach our 127.0.0.1:<port>
+ * redirect — both fail in containers and headless setups. Device flow needs
+ * only outbound HTTPS to the IdP and surfaces a short URL + user_code that
+ * the user opens on any device with a browser.
+ *
+ * CLI subcommand `redash-mcp login` still attempts to spawn the user's
+ * browser (`open` / `start` / `xdg-open`) as a convenience for interactive
+ * terminal use, but silently degrades when no browser is reachable.
  */
 
-import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
-import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn, execSync } from 'child_process';
-import { AddressInfo } from 'net';
+import { spawn } from 'child_process';
 import axios from 'axios';
 
 import { logger } from './logger.js';
@@ -41,7 +43,6 @@ export interface CachedTokens {
 }
 
 interface DiscoveryDocument {
-  authorization_endpoint: string;
   token_endpoint: string;
   device_authorization_endpoint?: string;
 }
@@ -62,9 +63,9 @@ export function loadOidcConfig(env: NodeJS.ProcessEnv = process.env): OidcConfig
   if (!clientId) throw new AuthError('REDASH_OIDC_CLIENT_ID is required');
 
   const audience = env.REDASH_OIDC_AUDIENCE || clientId;
-  // offline_access is requested by default so the cache can renew without
-  // re-opening the browser. Override with REDASH_OIDC_SCOPES if the IdP
-  // doesn't support it.
+  // offline_access requested by default so cached tokens can renew without a
+  // fresh browser dance. Override with REDASH_OIDC_SCOPES if the IdP doesn't
+  // support it.
   const scopes = env.REDASH_OIDC_SCOPES || 'openid email offline_access';
 
   return { issuer, clientId, audience, scopes };
@@ -95,7 +96,6 @@ async function writeTokenCache(file: string, tokens: CachedTokens): Promise<void
   const tmp = `${file}.${process.pid}.tmp`;
   await fsp.writeFile(tmp, JSON.stringify(tokens, null, 2), { mode: 0o600 });
   await fsp.rename(tmp, file);
-  // rename preserves the mode on POSIX but be defensive.
   try { await fsp.chmod(file, 0o600); } catch { /* best effort */ }
 }
 
@@ -107,88 +107,13 @@ async function discover(issuer: string): Promise<DiscoveryDocument> {
   const url = `${issuer}/.well-known/openid-configuration`;
   try {
     const { data } = await axios.get<DiscoveryDocument>(url, { timeout: 10_000 });
-    if (!data.authorization_endpoint || !data.token_endpoint) {
-      throw new AuthError(`Discovery document at ${url} is missing endpoints`);
+    if (!data.token_endpoint) {
+      throw new AuthError(`Discovery document at ${url} is missing token_endpoint`);
     }
     return data;
   } catch (err: any) {
+    if (err instanceof AuthError) throw err;
     throw new AuthError(`OIDC discovery failed for ${url}: ${err?.message || err}`, err);
-  }
-}
-
-function base64UrlEncode(buf: Buffer): string {
-  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-function generatePkcePair(): { verifier: string; challenge: string } {
-  const verifier = base64UrlEncode(crypto.randomBytes(64));
-  const challenge = base64UrlEncode(crypto.createHash('sha256').update(verifier).digest());
-  return { verifier, challenge };
-}
-
-/**
- * Decide which OIDC flow to use for this environment.
- *
- * The default PKCE+loopback flow assumes (a) we can actually launch a
- * browser on the machine running this process, and (b) the user's browser
- * can reach our 127.0.0.1 redirect URI. Both are false in containers and
- * any environment where the browser-launching command (`xdg-open` /
- * `open` / `cmd start`) is unreachable, so for those we fall back to
- * RFC 8628 Device Authorization Grant which needs only outbound HTTPS to
- * the IdP.
- *
- * Pre-flight (this function) checks command existence synchronously. The
- * underlying spawn at request time still has best-effort error handling
- * but the pre-flight catches the common failure modes (xdg-open missing,
- * Linux without DISPLAY) before we commit to a flow whose fallback URL
- * the user couldn't actually use.
- *
- * Overridable with `REDASH_OIDC_FLOW=device` / `REDASH_OIDC_FLOW=pkce`.
- */
-type AuthFlow = 'pkce' | 'device';
-export function selectAuthFlow(env: NodeJS.ProcessEnv = process.env): AuthFlow {
-  const override = (env.REDASH_OIDC_FLOW || '').toLowerCase();
-  if (override === 'device' || override === 'pkce') return override;
-  if (detectContainerLike(env)) return 'device';
-  if (!canLaunchBrowser(env)) return 'device';
-  return 'pkce';
-}
-
-function detectContainerLike(env: NodeJS.ProcessEnv): boolean {
-  // Kubernetes always injects this.
-  if (env.KUBERNETES_SERVICE_HOST) return true;
-  // systemd-nspawn / podman / some Docker setups expose this.
-  if (env.container) return true;
-  // Docker.
-  try { if (fs.existsSync('/.dockerenv')) return true; } catch { /* ignore */ }
-  // Podman.
-  try { if (fs.existsSync('/run/.containerenv')) return true; } catch { /* ignore */ }
-  // cgroup heuristic — last resort.
-  try {
-    const cg = fs.readFileSync('/proc/1/cgroup', 'utf8');
-    if (/\b(docker|kubepods|containerd|libpod|garden)\b/.test(cg)) return true;
-  } catch { /* /proc/1/cgroup may not exist or be readable */ }
-  return false;
-}
-
-/**
- * Can we synchronously verify that a browser launch will succeed on this
- * platform? Returns false when the platform-specific opener is missing or
- * when the platform has no display server. Treat false as "use device flow
- * instead" — the URL we'd surface for PKCE would be a loopback redirect
- * the user's browser can't reach anyway in the headless/missing-opener case.
- */
-function canLaunchBrowser(env: NodeJS.ProcessEnv): boolean {
-  const platform = process.platform;
-  if (platform === 'darwin') return true;   // /usr/bin/open ships with macOS
-  if (platform === 'win32') return true;    // cmd.exe + `start` always available
-  // Linux / *BSD / others — need a display server AND xdg-open.
-  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return false;
-  try {
-    execSync('command -v xdg-open', { stdio: 'ignore', shell: '/bin/sh' });
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -203,69 +128,11 @@ function openBrowser(url: string): void {
 
   try {
     const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
-    child.on('error', () => { /* surfaced via the manual-URL message below */ });
+    child.on('error', () => { /* user has the URL printed regardless */ });
     child.unref();
   } catch {
     // Caller already prints the URL so the user can paste it manually.
   }
-}
-
-interface CallbackResult {
-  code: string;
-  state: string;
-}
-
-function awaitCallback(expectedState: string, timeoutMs: number): Promise<{ result: CallbackResult; port: number; redirectUri: string; close: () => void }> {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url || '/', `http://127.0.0.1`);
-      if (url.pathname !== '/callback') {
-        res.writeHead(404).end();
-        return;
-      }
-      const error = url.searchParams.get('error');
-      if (error) {
-        const description = url.searchParams.get('error_description') || '';
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(`<h1>Login failed</h1><p>${error}: ${description}</p>`);
-        reject(new AuthError(`IdP returned error: ${error} ${description}`));
-        return;
-      }
-      const code = url.searchParams.get('code');
-      const state = url.searchParams.get('state');
-      if (!code || !state) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h1>Missing code or state</h1>');
-        reject(new AuthError('Callback missing code or state'));
-        return;
-      }
-      if (state !== expectedState) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h1>State mismatch</h1>');
-        reject(new AuthError('CSRF state mismatch on OIDC callback'));
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<h1>Logged in</h1><p>You can close this tab and return to the terminal.</p>');
-      resolve({ result: { code, state }, port: (server.address() as AddressInfo).port, redirectUri: '', close: () => server.close() });
-    });
-
-    server.on('error', (err) => reject(new AuthError(`Loopback server error: ${err.message}`, err)));
-    server.listen(0, '127.0.0.1', () => {
-      const port = (server.address() as AddressInfo).port;
-      const redirectUri = `http://127.0.0.1:${port}/callback`;
-      // Expose port + redirectUri to the caller before any redirect arrives by
-      // resolving the timeout-controlled promise from the outer login() below.
-      (server as any)._redashCliRedirectUri = redirectUri;
-      (server as any)._redashCliPort = port;
-    });
-
-    const timer = setTimeout(() => {
-      try { server.close(); } catch { /* ignore */ }
-      reject(new AuthError(`Timed out waiting for OIDC callback after ${timeoutMs}ms`));
-    }, timeoutMs);
-    server.on('close', () => clearTimeout(timer));
-  });
 }
 
 interface TokenResponse {
@@ -275,29 +142,6 @@ interface TokenResponse {
   refresh_token?: string;
   id_token?: string;
   scope?: string;
-}
-
-async function exchangeCodeForTokens(
-  tokenEndpoint: string,
-  params: { code: string; clientId: string; redirectUri: string; codeVerifier: string },
-): Promise<TokenResponse> {
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code: params.code,
-    redirect_uri: params.redirectUri,
-    client_id: params.clientId,
-    code_verifier: params.codeVerifier,
-  });
-  try {
-    const { data } = await axios.post<TokenResponse>(tokenEndpoint, body.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-      timeout: 15_000,
-    });
-    return data;
-  } catch (err: any) {
-    const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
-    throw new AuthError(`Token exchange failed: ${detail}`, err);
-  }
 }
 
 interface DeviceCodeResponse {
@@ -410,122 +254,21 @@ function tokenResponseToCached(resp: TokenResponse, cfg: OidcConfig, fallbackRef
 }
 
 interface LoginFlowHandle {
-  flow: AuthFlow;
-  /** URL the user opens — PKCE auth URL or device verification_uri_complete. */
+  /** Pre-filled verification URL the user opens (`verification_uri_complete` if present, else bare `verification_uri`). */
   url: string;
-  /** Device flow only — short code in case verification_uri_complete is not accepted. */
-  userCode?: string;
-  /** Promise resolves with cached tokens once the user finishes browser-side auth. */
+  /** Short user-typeable code as a fallback for clients that can't load the pre-filled URL. */
+  userCode: string;
+  /** Resolves with cached tokens once the user completes browser-side authorization. */
   completion: Promise<CachedTokens>;
-  /** Seconds until the flow expires. PKCE: timeoutMs/1000; device: server-provided expires_in. */
+  /** Seconds the user has to complete authorization before `completion` rejects. */
   expiresInSec: number;
 }
 
 /**
- * Start a PKCE login flow: spin up the loopback callback server, build the
- * auth URL, and return both immediately. The caller decides how to surface
- * the URL (auto-launch browser in a terminal, return it via tool response in
- * an MCP context, etc.) and may await `completion` to receive the cached
- * tokens once the callback arrives.
- */
-async function beginPkceFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
-  const cfg = opts.cfg ?? loadOidcConfig();
-  const cache = opts.cachePath ?? tokenCachePath();
-  const timeoutMs = opts.timeoutMs ?? 5 * 60_000;
-
-  const discovery = await discover(cfg.issuer);
-  const { verifier, challenge } = generatePkcePair();
-  const state = base64UrlEncode(crypto.randomBytes(16));
-
-  const server = http.createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const port = (server.address() as AddressInfo).port;
-  const redirectUri = `http://127.0.0.1:${port}/callback`;
-
-  const callbackPromise = new Promise<CallbackResult>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new AuthError(`Timed out waiting for OIDC callback after ${timeoutMs}ms`));
-      try { server.close(); } catch { /* ignore */ }
-    }, timeoutMs);
-
-    server.on('request', (req, res) => {
-      const url = new URL(req.url || '/', `http://127.0.0.1:${port}`);
-      if (url.pathname !== '/callback') { res.writeHead(404).end(); return; }
-      const errorParam = url.searchParams.get('error');
-      if (errorParam) {
-        const description = url.searchParams.get('error_description') || '';
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(`<h1>Login failed</h1><p>${errorParam}: ${description}</p>`);
-        clearTimeout(timer);
-        reject(new AuthError(`IdP returned error: ${errorParam} ${description}`));
-        return;
-      }
-      const code = url.searchParams.get('code');
-      const stateParam = url.searchParams.get('state');
-      if (!code || !stateParam) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h1>Missing code or state</h1>');
-        clearTimeout(timer);
-        reject(new AuthError('Callback missing code or state'));
-        return;
-      }
-      if (stateParam !== state) {
-        res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end('<h1>State mismatch</h1>');
-        clearTimeout(timer);
-        reject(new AuthError('CSRF state mismatch on OIDC callback'));
-        return;
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end('<h1>Logged in</h1><p>You can close this tab and return to the terminal.</p>');
-      clearTimeout(timer);
-      resolve({ code, state: stateParam });
-    });
-  });
-
-  const authUrl = new URL(discovery.authorization_endpoint);
-  authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('client_id', cfg.clientId);
-  authUrl.searchParams.set('redirect_uri', redirectUri);
-  authUrl.searchParams.set('scope', cfg.scopes);
-  authUrl.searchParams.set('audience', cfg.audience);
-  authUrl.searchParams.set('state', state);
-  authUrl.searchParams.set('code_challenge', challenge);
-  authUrl.searchParams.set('code_challenge_method', 'S256');
-
-  const completion = (async () => {
-    try {
-      const callback = await callbackPromise;
-      const tokens = await exchangeCodeForTokens(discovery.token_endpoint, {
-        code: callback.code,
-        clientId: cfg.clientId,
-        redirectUri,
-        codeVerifier: verifier,
-      });
-      const cached = tokenResponseToCached(tokens, cfg);
-      await writeTokenCache(cache, cached);
-      return cached;
-    } finally {
-      try { server.close(); } catch { /* ignore */ }
-    }
-  })();
-
-  return {
-    flow: 'pkce',
-    url: authUrl.toString(),
-    completion,
-    expiresInSec: Math.floor(timeoutMs / 1000),
-  };
-}
-
-/**
- * Start an OAuth 2.0 Device Authorization Grant (RFC 8628) flow. Requests a
- * device code from the IdP and starts polling the token endpoint in the
- * background. Works in containers / headless / locked-down environments
- * because it needs only outbound HTTPS to the IdP — no loopback redirect.
+ * Start an RFC 8628 Device Authorization Grant flow. Requests a device code
+ * and starts polling the token endpoint in the background. Returns the
+ * user-facing URL + code immediately; await `completion` to receive cached
+ * tokens once the user finishes browser-side authorization.
  */
 async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<LoginFlowHandle> {
   const cfg = opts.cfg ?? loadOidcConfig();
@@ -535,7 +278,7 @@ async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = 
   if (!discovery.device_authorization_endpoint) {
     throw new AuthError(
       `IdP discovery document at ${cfg.issuer} does not advertise device_authorization_endpoint. ` +
-      `Enable RFC 8628 device flow on the OIDC provider or set REDASH_OIDC_FLOW=pkce.`,
+      `Enable RFC 8628 device flow on the OIDC provider before using this MCP server.`,
     );
   }
 
@@ -558,7 +301,6 @@ async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = 
   })();
 
   return {
-    flow: 'device',
     url: dc.verification_uri_complete || dc.verification_uri,
     userCode: dc.user_code,
     completion,
@@ -567,105 +309,62 @@ async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = 
 }
 
 /**
- * Dispatch to PKCE or device flow based on `selectAuthFlow()`. PKCE for
- * regular desktops (browser available, loopback reachable); device flow for
- * containers / headless. Override with `REDASH_OIDC_FLOW`.
+ * Run a full device-flow login from a terminal: print the URL + user code,
+ * try to open the browser (best-effort — silently no-ops if unavailable),
+ * then poll for the token. Intended for `redash-mcp login`.
  */
-async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
-  const flow = selectAuthFlow();
-  logger.debug(`Selected OIDC auth flow: ${flow}`);
-  if (flow === 'device') return beginDeviceFlow(opts);
-  return beginPkceFlow(opts);
-}
-
-/**
- * Run the full PKCE login flow: open browser, wait for callback, exchange
- * code, persist tokens. Intended to be invoked from `redash-mcp login`
- * (interactive terminal). For the MCP server path see `startPendingLogin`.
- */
-export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
-  const handle = await beginLoginFlow(opts);
-  if (handle.flow === 'device') {
-    process.stderr.write(
-      `\nDevice authorization required. Open this URL in your browser:\n  ${handle.url}\n\n` +
-      `If you're prompted for a code, enter: ${handle.userCode}\n` +
-      `(code expires in ${handle.expiresInSec}s)\n\n`,
-    );
-  } else {
-    process.stderr.write(`\nOpen this URL in your browser if it doesn't open automatically:\n  ${handle.url}\n\n`);
-  }
+export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<CachedTokens> {
+  const handle = await beginDeviceFlow(opts);
+  process.stderr.write(
+    `\nDevice authorization required. Open this URL in your browser:\n  ${handle.url}\n\n` +
+    `If the page asks for a code, enter: ${handle.userCode}\n` +
+    `(code expires in ${handle.expiresInSec}s)\n\n`,
+  );
   openBrowser(handle.url);
   return handle.completion;
 }
 
 interface PendingLogin {
-  flow: AuthFlow;
   url: string;
-  userCode?: string;
+  userCode: string;
   completion: Promise<CachedTokens>;
   expiresAt: number;
-  browserLaunched: boolean;
 }
 
 let pendingLogin: PendingLogin | null = null;
 
 /**
- * Start (or attach to) a non-interactive login flow (PKCE or device — see
- * `selectAuthFlow`). The flow runs in the background. Caller surfaces `url`
- * (and `userCode` for device flow) to the user via MCP tool response. Once
- * the user finishes browser-side authorization the tokens are written to
- * cache and the next call succeeds.
- *
- * For the PKCE branch (i.e. non-container desktop) we additionally try to
- * spawn the user's default browser here — the user's command sits on the
- * same machine as this MCP process, so `open` / `start` / `xdg-open` will
- * pop up a window they can see and complete. For device flow we don't, both
- * because the server may have no browser at all and because the IdP page is
- * meant to be opened on a separate trusted device. Opt out with
- * `REDASH_OIDC_AUTO_LAUNCH_BROWSER=false`.
+ * Start (or attach to) a non-interactive device login. The IdP issues a
+ * device code and pre-filled verification URL; the caller surfaces both to
+ * the user via an MCP tool response and waits for the user to complete the
+ * flow on a separate device. Returns immediately.
  *
  * Concurrent callers share one in-flight login until it resolves or its
- * `expiresAt` passes. Browser is launched only on the first attempt.
+ * `expiresAt` passes.
  */
-export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ flow: AuthFlow; url: string; userCode?: string; expiresAt: number; browserLaunched: boolean }> {
+export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<{ url: string; userCode: string; expiresAt: number }> {
   if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
-    return {
-      flow: pendingLogin.flow,
-      url: pendingLogin.url,
-      userCode: pendingLogin.userCode,
-      expiresAt: pendingLogin.expiresAt,
-      browserLaunched: pendingLogin.browserLaunched,
-    };
+    return { url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
   }
 
-  const handle = await beginLoginFlow(opts);
-  const autoLaunchOpt = (process.env.REDASH_OIDC_AUTO_LAUNCH_BROWSER || '').toLowerCase();
-  const autoLaunchDisabled = autoLaunchOpt === 'false' || autoLaunchOpt === '0' || autoLaunchOpt === 'no';
-  const browserLaunched = handle.flow === 'pkce' && !autoLaunchDisabled;
-  if (browserLaunched) {
-    openBrowser(handle.url);
-  }
-
+  const handle = await beginDeviceFlow(opts);
   const entry: PendingLogin = {
-    flow: handle.flow,
     url: handle.url,
     userCode: handle.userCode,
     completion: handle.completion,
     expiresAt: Date.now() + handle.expiresInSec * 1000,
-    browserLaunched,
   };
   pendingLogin = entry;
   handle.completion.finally(() => {
     if (pendingLogin === entry) pendingLogin = null;
   }).catch(() => { /* errors surface via the next ensureValidTokens call */ });
 
-  return { flow: entry.flow, url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt, browserLaunched };
+  return { url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt };
 }
 
 /**
  * Read the cached tokens and refresh if near expiry. Throws AuthError if no
- * usable cache exists — callers should surface a "run `redash-mcp login`"
- * message instead of falling back to a different auth method.
+ * usable cache exists.
  */
 export async function getValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
   const cfg = opts.cfg ?? loadOidcConfig();
@@ -729,13 +428,11 @@ export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string 
 
 /**
  * Like getValidTokens, but on cache miss / unrecoverable AuthError starts a
- * pending login flow and throws an AuthError whose message contains the auth
- * URL (and on PKCE non-container desktops, the browser is also auto-launched
- * by `startPendingLogin`). The caller surfaces the URL to the user via a
- * tool response so they have a clickable fallback in case the auto-launch
- * silently failed. Once the user completes the browser flow, the loopback
- * callback (PKCE) or device-flow polling (device) hydrates the cache and the
- * next call to this function succeeds.
+ * device flow in the background and throws an AuthError whose message
+ * contains the verification URL and user code. The caller surfaces this to
+ * the user via a tool response. Once the user completes the device flow on
+ * their browser, the polling resolves, the cache is hydrated, and the next
+ * call to this function succeeds.
  */
 export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
   try {
@@ -743,14 +440,10 @@ export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: st
   } catch (err) {
     if (!(err instanceof AuthError)) throw err;
     const pending = await startPendingLogin(opts);
-    const codeLine = pending.flow === 'device' && pending.userCode
-      ? `\nIf the page asks for a code, enter: ${pending.userCode}`
-      : '';
-    const lead = pending.browserLaunched
-      ? `OIDC login required. Your browser should have opened automatically — if not, open this URL manually:`
-      : `OIDC login required. Open this URL in your browser to authenticate:`;
     throw new AuthError(
-      `${lead}\n\n  ${pending.url}${codeLine}\n\nAfter completing the browser flow, retry the tool call.`,
+      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${pending.url}\n\n` +
+      `If the page asks for a code, enter: ${pending.userCode}\n\n` +
+      `After completing the browser flow, retry the tool call.`,
     );
   }
 }
