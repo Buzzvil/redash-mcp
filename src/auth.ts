@@ -469,6 +469,32 @@ export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string 
 }
 
 /**
+ * Build an AuthError that contains both the verification URL (for the user)
+ * and the next-action instruction (for the assistant — surface URL + call
+ * `wait_for_oidc_login`, then retry the original tool). Starts a fresh
+ * pending device flow if one is not already in progress.
+ *
+ * Used by `ensureValidTokens` for cold cache-miss and by the redash API
+ * client's 401 retry path when a stale token can't be refreshed.
+ */
+export async function makeLoginRequiredError(
+  reason: string,
+  opts: { cfg?: OidcConfig; cachePath?: string } = {},
+): Promise<AuthError> {
+  const pending = await startPendingLogin(opts);
+  return new AuthError(
+    `${reason}\n\n` +
+    `## For the user\n` +
+    `Open this URL in your browser to authorize:\n  ${pending.url}\n` +
+    `If the page asks for a code, enter: ${pending.userCode}\n\n` +
+    `## For the assistant\n` +
+    `In this same response: surface the URL above to the user, then immediately call the \`wait_for_oidc_login\` tool. ` +
+    `It will block until the user finishes the browser flow (or the device code expires). ` +
+    `Once it returns successfully, retry the original tool call — do not ask the user for confirmation in between.`,
+  );
+}
+
+/**
  * Like getValidTokens, but on cache miss / unrecoverable AuthError starts a
  * device flow in the background and throws an AuthError whose message
  * contains the verification URL and user code. The caller surfaces this to
@@ -481,17 +507,7 @@ export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: st
     return await getValidTokens(opts);
   } catch (err) {
     if (!(err instanceof AuthError)) throw err;
-    const pending = await startPendingLogin(opts);
-    throw new AuthError(
-      `Authorization required to access Redash.\n\n` +
-      `## For the user\n` +
-      `Open this URL in your browser to authorize:\n  ${pending.url}\n` +
-      `If the page asks for a code, enter: ${pending.userCode}\n\n` +
-      `## For the assistant\n` +
-      `In this same response: surface the URL above to the user, then immediately call the \`wait_for_oidc_login\` tool. ` +
-      `It will block until the user finishes the browser flow (or the device code expires). ` +
-      `Once it returns successfully, retry the original tool call — do not ask the user for confirmation in between.`,
-    );
+    throw await makeLoginRequiredError('Authorization required to access Redash.', opts);
   }
 }
 
