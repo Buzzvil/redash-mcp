@@ -15,7 +15,7 @@ import * as fsp from 'fs/promises';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { AddressInfo } from 'net';
 import axios from 'axios';
 
@@ -129,11 +129,19 @@ function generatePkcePair(): { verifier: string; challenge: string } {
 /**
  * Decide which OIDC flow to use for this environment.
  *
- * The default PKCE+loopback flow assumes (a) we can spawn a browser on the
- * machine running this process, and (b) the user's browser can reach our
- * 127.0.0.1 redirect URI. Both are false in containers and headless Linux,
- * so for those we fall back to RFC 8628 Device Authorization Grant which
- * needs only outbound HTTPS to the IdP.
+ * The default PKCE+loopback flow assumes (a) we can actually launch a
+ * browser on the machine running this process, and (b) the user's browser
+ * can reach our 127.0.0.1 redirect URI. Both are false in containers and
+ * any environment where the browser-launching command (`xdg-open` /
+ * `open` / `cmd start`) is unreachable, so for those we fall back to
+ * RFC 8628 Device Authorization Grant which needs only outbound HTTPS to
+ * the IdP.
+ *
+ * Pre-flight (this function) checks command existence synchronously. The
+ * underlying spawn at request time still has best-effort error handling
+ * but the pre-flight catches the common failure modes (xdg-open missing,
+ * Linux without DISPLAY) before we commit to a flow whose fallback URL
+ * the user couldn't actually use.
  *
  * Overridable with `REDASH_OIDC_FLOW=device` / `REDASH_OIDC_FLOW=pkce`.
  */
@@ -141,7 +149,9 @@ type AuthFlow = 'pkce' | 'device';
 export function selectAuthFlow(env: NodeJS.ProcessEnv = process.env): AuthFlow {
   const override = (env.REDASH_OIDC_FLOW || '').toLowerCase();
   if (override === 'device' || override === 'pkce') return override;
-  return detectContainerLike(env) ? 'device' : 'pkce';
+  if (detectContainerLike(env)) return 'device';
+  if (!canLaunchBrowser(env)) return 'device';
+  return 'pkce';
 }
 
 function detectContainerLike(env: NodeJS.ProcessEnv): boolean {
@@ -158,11 +168,28 @@ function detectContainerLike(env: NodeJS.ProcessEnv): boolean {
     const cg = fs.readFileSync('/proc/1/cgroup', 'utf8');
     if (/\b(docker|kubepods|containerd|libpod|garden)\b/.test(cg)) return true;
   } catch { /* /proc/1/cgroup may not exist or be readable */ }
-  // Headless Linux can't reach a browser either way — treat as container.
-  if (process.platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
-    return true;
-  }
   return false;
+}
+
+/**
+ * Can we synchronously verify that a browser launch will succeed on this
+ * platform? Returns false when the platform-specific opener is missing or
+ * when the platform has no display server. Treat false as "use device flow
+ * instead" — the URL we'd surface for PKCE would be a loopback redirect
+ * the user's browser can't reach anyway in the headless/missing-opener case.
+ */
+function canLaunchBrowser(env: NodeJS.ProcessEnv): boolean {
+  const platform = process.platform;
+  if (platform === 'darwin') return true;   // /usr/bin/open ships with macOS
+  if (platform === 'win32') return true;    // cmd.exe + `start` always available
+  // Linux / *BSD / others — need a display server AND xdg-open.
+  if (!env.DISPLAY && !env.WAYLAND_DISPLAY) return false;
+  try {
+    execSync('command -v xdg-open', { stdio: 'ignore', shell: '/bin/sh' });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function openBrowser(url: string): void {
