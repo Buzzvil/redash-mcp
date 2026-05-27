@@ -76,17 +76,12 @@ async function runStatus(): Promise<void> {
 
 async function runServer(): Promise<void> {
   requireServerEnv();
-  // Ensure a usable token exists before binding stdio. If the cache is
-  // missing/expired-without-refresh, ensureValidTokens transparently runs the
-  // PKCE browser flow now — that keeps the "no explicit login step" UX for
-  // plugin users at the cost of a one-time browser popup on first use.
-  const { ensureValidTokens } = await import('./auth.js');
-  try {
-    await ensureValidTokens();
-  } catch (err: any) {
-    process.stderr.write(`Fatal: failed to obtain OIDC tokens: ${err?.message || err}\n`);
-    process.exit(1);
-  }
+  // Do NOT check auth here. The MCP server runs as a stdio subprocess of the
+  // host (Claude Desktop / IDE), and any browser popup launched during boot
+  // is invisible to the user — they have no way to know what's happening.
+  // Auth is deferred to the request interceptor in redashClient.ts: the first
+  // tool call triggers the PKCE flow if no usable token is cached, so the
+  // browser opens in response to an explicit user action.
   await import('./index.js');
 }
 
