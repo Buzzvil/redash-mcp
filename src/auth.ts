@@ -43,6 +43,7 @@ export interface CachedTokens {
 interface DiscoveryDocument {
   authorization_endpoint: string;
   token_endpoint: string;
+  device_authorization_endpoint?: string;
 }
 
 const REFRESH_LEEWAY_MS = 60_000; // refresh 60s before expiry
@@ -123,6 +124,45 @@ function generatePkcePair(): { verifier: string; challenge: string } {
   const verifier = base64UrlEncode(crypto.randomBytes(64));
   const challenge = base64UrlEncode(crypto.createHash('sha256').update(verifier).digest());
   return { verifier, challenge };
+}
+
+/**
+ * Decide which OIDC flow to use for this environment.
+ *
+ * The default PKCE+loopback flow assumes (a) we can spawn a browser on the
+ * machine running this process, and (b) the user's browser can reach our
+ * 127.0.0.1 redirect URI. Both are false in containers and headless Linux,
+ * so for those we fall back to RFC 8628 Device Authorization Grant which
+ * needs only outbound HTTPS to the IdP.
+ *
+ * Overridable with `REDASH_OIDC_FLOW=device` / `REDASH_OIDC_FLOW=pkce`.
+ */
+type AuthFlow = 'pkce' | 'device';
+export function selectAuthFlow(env: NodeJS.ProcessEnv = process.env): AuthFlow {
+  const override = (env.REDASH_OIDC_FLOW || '').toLowerCase();
+  if (override === 'device' || override === 'pkce') return override;
+  return detectContainerLike(env) ? 'device' : 'pkce';
+}
+
+function detectContainerLike(env: NodeJS.ProcessEnv): boolean {
+  // Kubernetes always injects this.
+  if (env.KUBERNETES_SERVICE_HOST) return true;
+  // systemd-nspawn / podman / some Docker setups expose this.
+  if (env.container) return true;
+  // Docker.
+  try { if (fs.existsSync('/.dockerenv')) return true; } catch { /* ignore */ }
+  // Podman.
+  try { if (fs.existsSync('/run/.containerenv')) return true; } catch { /* ignore */ }
+  // cgroup heuristic — last resort.
+  try {
+    const cg = fs.readFileSync('/proc/1/cgroup', 'utf8');
+    if (/\b(docker|kubepods|containerd|libpod|garden)\b/.test(cg)) return true;
+  } catch { /* /proc/1/cgroup may not exist or be readable */ }
+  // Headless Linux can't reach a browser either way — treat as container.
+  if (process.platform === 'linux' && !env.DISPLAY && !env.WAYLAND_DISPLAY) {
+    return true;
+  }
+  return false;
 }
 
 function openBrowser(url: string): void {
@@ -233,6 +273,82 @@ async function exchangeCodeForTokens(
   }
 }
 
+interface DeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  expires_in: number;
+  interval: number;
+}
+
+async function requestDeviceCode(
+  deviceAuthEndpoint: string,
+  params: { clientId: string; scopes: string; audience?: string },
+): Promise<DeviceCodeResponse> {
+  const body = new URLSearchParams({
+    client_id: params.clientId,
+    scope: params.scopes,
+  });
+  if (params.audience) body.set('audience', params.audience);
+  try {
+    const { data } = await axios.post<DeviceCodeResponse>(deviceAuthEndpoint, body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      timeout: 15_000,
+    });
+    if (!data.device_code || !data.user_code || !data.verification_uri) {
+      throw new AuthError('Device authorization response missing required fields');
+    }
+    return data;
+  } catch (err: any) {
+    if (err instanceof AuthError) throw err;
+    const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
+    throw new AuthError(`Device authorization request failed: ${detail}`, err);
+  }
+}
+
+async function pollForDeviceToken(
+  tokenEndpoint: string,
+  params: { clientId: string; deviceCode: string; initialIntervalSec: number; expiresInSec: number },
+): Promise<TokenResponse> {
+  const deadline = Date.now() + params.expiresInSec * 1000;
+  let intervalMs = Math.max(params.initialIntervalSec, 1) * 1000;
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+    device_code: params.deviceCode,
+    client_id: params.clientId,
+  });
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    try {
+      const { data } = await axios.post<TokenResponse>(tokenEndpoint, body.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+        timeout: 15_000,
+        validateStatus: () => true, // RFC 8628 signals pending/slow_down via 400
+      });
+      if (data && (data as any).error === undefined && data.access_token) {
+        return data;
+      }
+      const errCode = (data as any)?.error;
+      if (errCode === 'authorization_pending') continue;
+      if (errCode === 'slow_down') { intervalMs += 5000; continue; }
+      if (errCode === 'expired_token') {
+        throw new AuthError('Device code expired before user completed authorization');
+      }
+      if (errCode === 'access_denied') {
+        throw new AuthError('User denied the device authorization request');
+      }
+      throw new AuthError(`Device token poll failed: ${JSON.stringify(data)}`);
+    } catch (err: any) {
+      if (err instanceof AuthError) throw err;
+      const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
+      throw new AuthError(`Device token poll failed: ${detail}`, err);
+    }
+  }
+  throw new AuthError(`Device code expired after ${params.expiresInSec}s`);
+}
+
 async function refreshTokens(
   tokenEndpoint: string,
   params: { refreshToken: string; clientId: string; scopes: string },
@@ -266,13 +382,16 @@ function tokenResponseToCached(resp: TokenResponse, cfg: OidcConfig, fallbackRef
   };
 }
 
-/**
- * Run the full PKCE login flow: open browser, wait for callback, exchange
- * code, persist tokens. Intended to be invoked from `redash-mcp login`.
- */
 interface LoginFlowHandle {
+  flow: AuthFlow;
+  /** URL the user opens — PKCE auth URL or device verification_uri_complete. */
   url: string;
+  /** Device flow only — short code in case verification_uri_complete is not accepted. */
+  userCode?: string;
+  /** Promise resolves with cached tokens once the user finishes browser-side auth. */
   completion: Promise<CachedTokens>;
+  /** Seconds until the flow expires. PKCE: timeoutMs/1000; device: server-provided expires_in. */
+  expiresInSec: number;
 }
 
 /**
@@ -282,7 +401,7 @@ interface LoginFlowHandle {
  * an MCP context, etc.) and may await `completion` to receive the cached
  * tokens once the callback arrives.
  */
-async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
+async function beginPkceFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
   const cfg = opts.cfg ?? loadOidcConfig();
   const cache = opts.cachePath ?? tokenCachePath();
   const timeoutMs = opts.timeoutMs ?? 5 * 60_000;
@@ -367,7 +486,69 @@ async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; time
     }
   })();
 
-  return { url: authUrl.toString(), completion };
+  return {
+    flow: 'pkce',
+    url: authUrl.toString(),
+    completion,
+    expiresInSec: Math.floor(timeoutMs / 1000),
+  };
+}
+
+/**
+ * Start an OAuth 2.0 Device Authorization Grant (RFC 8628) flow. Requests a
+ * device code from the IdP and starts polling the token endpoint in the
+ * background. Works in containers / headless / locked-down environments
+ * because it needs only outbound HTTPS to the IdP — no loopback redirect.
+ */
+async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<LoginFlowHandle> {
+  const cfg = opts.cfg ?? loadOidcConfig();
+  const cache = opts.cachePath ?? tokenCachePath();
+
+  const discovery = await discover(cfg.issuer);
+  if (!discovery.device_authorization_endpoint) {
+    throw new AuthError(
+      `IdP discovery document at ${cfg.issuer} does not advertise device_authorization_endpoint. ` +
+      `Enable RFC 8628 device flow on the OIDC provider or set REDASH_OIDC_FLOW=pkce.`,
+    );
+  }
+
+  const dc = await requestDeviceCode(discovery.device_authorization_endpoint, {
+    clientId: cfg.clientId,
+    scopes: cfg.scopes,
+    audience: cfg.audience,
+  });
+
+  const completion = (async () => {
+    const tokens = await pollForDeviceToken(discovery.token_endpoint, {
+      clientId: cfg.clientId,
+      deviceCode: dc.device_code,
+      initialIntervalSec: dc.interval || 5,
+      expiresInSec: dc.expires_in,
+    });
+    const cached = tokenResponseToCached(tokens, cfg);
+    await writeTokenCache(cache, cached);
+    return cached;
+  })();
+
+  return {
+    flow: 'device',
+    url: dc.verification_uri_complete || dc.verification_uri,
+    userCode: dc.user_code,
+    completion,
+    expiresInSec: dc.expires_in,
+  };
+}
+
+/**
+ * Dispatch to PKCE or device flow based on `selectAuthFlow()`. PKCE for
+ * regular desktops (browser available, loopback reachable); device flow for
+ * containers / headless. Override with `REDASH_OIDC_FLOW`.
+ */
+async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<LoginFlowHandle> {
+  const flow = selectAuthFlow();
+  logger.debug(`Selected OIDC auth flow: ${flow}`);
+  if (flow === 'device') return beginDeviceFlow(opts);
+  return beginPkceFlow(opts);
 }
 
 /**
@@ -376,50 +557,59 @@ async function beginLoginFlow(opts: { cfg?: OidcConfig; cachePath?: string; time
  * (interactive terminal). For the MCP server path see `startPendingLogin`.
  */
 export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
-  const { url, completion } = await beginLoginFlow(opts);
-  process.stderr.write(`\nOpen this URL in your browser if it doesn't open automatically:\n  ${url}\n\n`);
-  openBrowser(url);
-  return completion;
+  const handle = await beginLoginFlow(opts);
+  if (handle.flow === 'device') {
+    process.stderr.write(
+      `\nDevice authorization required. Open this URL in your browser:\n  ${handle.url}\n\n` +
+      `If you're prompted for a code, enter: ${handle.userCode}\n` +
+      `(code expires in ${handle.expiresInSec}s)\n\n`,
+    );
+  } else {
+    process.stderr.write(`\nOpen this URL in your browser if it doesn't open automatically:\n  ${handle.url}\n\n`);
+  }
+  openBrowser(handle.url);
+  return handle.completion;
 }
 
 interface PendingLogin {
+  flow: AuthFlow;
   url: string;
+  userCode?: string;
   completion: Promise<CachedTokens>;
-  startedAt: number;
+  expiresAt: number;
 }
 
 let pendingLogin: PendingLogin | null = null;
-const PENDING_LOGIN_TTL_MS = 5 * 60_000;
 
 /**
- * Start (or attach to) a non-interactive PKCE login. The loopback callback
- * server is started but the browser is NOT auto-launched — the caller surfaces
- * the returned URL to a user-facing channel (MCP tool response) and the user
- * clicks/pastes it themselves. Returns immediately with the URL.
+ * Start (or attach to) a non-interactive login flow (PKCE or device — see
+ * `selectAuthFlow`). The flow runs in the background; the browser is NOT
+ * auto-launched here. Caller surfaces `url` (and `userCode` for device flow)
+ * to the user via MCP tool response. Once the user finishes browser-side
+ * authorization the tokens are written to cache and the next call succeeds.
  *
- * Concurrent callers share one in-flight login. Once the callback arrives the
- * tokens are cached and `pendingLogin` is cleared so subsequent failures start
- * a fresh flow.
+ * Concurrent callers share one in-flight login until it resolves or its
+ * `expiresAt` passes.
  */
-export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ url: string }> {
-  if (pendingLogin && Date.now() - pendingLogin.startedAt < PENDING_LOGIN_TTL_MS) {
-    return { url: pendingLogin.url };
+export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ flow: AuthFlow; url: string; userCode?: string; expiresAt: number }> {
+  if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
+    return { flow: pendingLogin.flow, url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
   }
 
-  const { url, completion } = await beginLoginFlow(opts);
-  const handle: PendingLogin = {
-    url,
-    completion,
-    startedAt: Date.now(),
+  const handle = await beginLoginFlow(opts);
+  const entry: PendingLogin = {
+    flow: handle.flow,
+    url: handle.url,
+    userCode: handle.userCode,
+    completion: handle.completion,
+    expiresAt: Date.now() + handle.expiresInSec * 1000,
   };
-  pendingLogin = handle;
-  // Clear pendingLogin once the flow resolves either way so a fresh attempt
-  // can start on the next failure.
-  completion.finally(() => {
-    if (pendingLogin === handle) pendingLogin = null;
+  pendingLogin = entry;
+  handle.completion.finally(() => {
+    if (pendingLogin === entry) pendingLogin = null;
   }).catch(() => { /* errors surface via the next ensureValidTokens call */ });
 
-  return { url };
+  return { flow: entry.flow, url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt };
 }
 
 /**
@@ -505,9 +695,12 @@ export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: st
     return await getValidTokens(opts);
   } catch (err) {
     if (!(err instanceof AuthError)) throw err;
-    const { url } = await startPendingLogin(opts);
+    const pending = await startPendingLogin(opts);
+    const codeLine = pending.flow === 'device' && pending.userCode
+      ? `\nIf the page asks for a code, enter: ${pending.userCode}`
+      : '';
     throw new AuthError(
-      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${url}\n\nAfter completing the browser flow, retry the tool call.`,
+      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${pending.url}${codeLine}\n\nAfter completing the browser flow, retry the tool call.`,
     );
   }
 }
