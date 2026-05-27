@@ -577,39 +577,62 @@ interface PendingLogin {
   userCode?: string;
   completion: Promise<CachedTokens>;
   expiresAt: number;
+  browserLaunched: boolean;
 }
 
 let pendingLogin: PendingLogin | null = null;
 
 /**
  * Start (or attach to) a non-interactive login flow (PKCE or device — see
- * `selectAuthFlow`). The flow runs in the background; the browser is NOT
- * auto-launched here. Caller surfaces `url` (and `userCode` for device flow)
- * to the user via MCP tool response. Once the user finishes browser-side
- * authorization the tokens are written to cache and the next call succeeds.
+ * `selectAuthFlow`). The flow runs in the background. Caller surfaces `url`
+ * (and `userCode` for device flow) to the user via MCP tool response. Once
+ * the user finishes browser-side authorization the tokens are written to
+ * cache and the next call succeeds.
+ *
+ * For the PKCE branch (i.e. non-container desktop) we additionally try to
+ * spawn the user's default browser here — the user's command sits on the
+ * same machine as this MCP process, so `open` / `start` / `xdg-open` will
+ * pop up a window they can see and complete. For device flow we don't, both
+ * because the server may have no browser at all and because the IdP page is
+ * meant to be opened on a separate trusted device. Opt out with
+ * `REDASH_OIDC_AUTO_LAUNCH_BROWSER=false`.
  *
  * Concurrent callers share one in-flight login until it resolves or its
- * `expiresAt` passes.
+ * `expiresAt` passes. Browser is launched only on the first attempt.
  */
-export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ flow: AuthFlow; url: string; userCode?: string; expiresAt: number }> {
+export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<{ flow: AuthFlow; url: string; userCode?: string; expiresAt: number; browserLaunched: boolean }> {
   if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
-    return { flow: pendingLogin.flow, url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
+    return {
+      flow: pendingLogin.flow,
+      url: pendingLogin.url,
+      userCode: pendingLogin.userCode,
+      expiresAt: pendingLogin.expiresAt,
+      browserLaunched: pendingLogin.browserLaunched,
+    };
   }
 
   const handle = await beginLoginFlow(opts);
+  const autoLaunchOpt = (process.env.REDASH_OIDC_AUTO_LAUNCH_BROWSER || '').toLowerCase();
+  const autoLaunchDisabled = autoLaunchOpt === 'false' || autoLaunchOpt === '0' || autoLaunchOpt === 'no';
+  const browserLaunched = handle.flow === 'pkce' && !autoLaunchDisabled;
+  if (browserLaunched) {
+    openBrowser(handle.url);
+  }
+
   const entry: PendingLogin = {
     flow: handle.flow,
     url: handle.url,
     userCode: handle.userCode,
     completion: handle.completion,
     expiresAt: Date.now() + handle.expiresInSec * 1000,
+    browserLaunched,
   };
   pendingLogin = entry;
   handle.completion.finally(() => {
     if (pendingLogin === entry) pendingLogin = null;
   }).catch(() => { /* errors surface via the next ensureValidTokens call */ });
 
-  return { flow: entry.flow, url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt };
+  return { flow: entry.flow, url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt, browserLaunched };
 }
 
 /**
@@ -679,16 +702,13 @@ export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string 
 
 /**
  * Like getValidTokens, but on cache miss / unrecoverable AuthError starts a
- * non-interactive login flow (loopback server only — no browser spawn) and
- * throws an AuthError whose message contains the auth URL. The caller is
- * expected to surface that URL to the user via a tool response; once the
- * user completes PKCE in their browser, the loopback server receives the
- * callback and the next call to this function succeeds.
- *
- * Why not auto-launch the browser: the MCP server typically runs as a stdio
- * subprocess (Claude Desktop / IDE) or in a container without `xdg-open`. A
- * silent browser spawn is invisible to the user; an explicit URL surfaced
- * through the tool response is universally actionable.
+ * pending login flow and throws an AuthError whose message contains the auth
+ * URL (and on PKCE non-container desktops, the browser is also auto-launched
+ * by `startPendingLogin`). The caller surfaces the URL to the user via a
+ * tool response so they have a clickable fallback in case the auto-launch
+ * silently failed. Once the user completes the browser flow, the loopback
+ * callback (PKCE) or device-flow polling (device) hydrates the cache and the
+ * next call to this function succeeds.
  */
 export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
   try {
@@ -699,8 +719,11 @@ export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: st
     const codeLine = pending.flow === 'device' && pending.userCode
       ? `\nIf the page asks for a code, enter: ${pending.userCode}`
       : '';
+    const lead = pending.browserLaunched
+      ? `OIDC login required. Your browser should have opened automatically — if not, open this URL manually:`
+      : `OIDC login required. Open this URL in your browser to authenticate:`;
     throw new AuthError(
-      `OIDC login required. Open this URL in your browser to authenticate:\n\n  ${pending.url}${codeLine}\n\nAfter completing the browser flow, retry the tool call.`,
+      `${lead}\n\n  ${pending.url}${codeLine}\n\nAfter completing the browser flow, retry the tool call.`,
     );
   }
 }
