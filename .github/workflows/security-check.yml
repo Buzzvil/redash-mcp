@@ -1,0 +1,8 @@
+name: Security Check
+on:
+  pull_request:
+
+jobs:
+  security-check:
+    uses: Buzzvil/workflows/.github/workflows/security-check.yaml@main
+    secrets: inherit
