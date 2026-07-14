@@ -5,7 +5,7 @@ import { defineConfig, devices } from '@playwright/test';
 // test runner) and the same issuer/client id that was used to mint it.
 const TEST_REDASH_URL = process.env.REDASH_URL || 'https://demo.redash.io';
 const TEST_OIDC_ISSUER = process.env.REDASH_OIDC_ISSUER || 'https://idp.example.com';
-const TEST_OIDC_CLIENT_ID = process.env.REDASH_OIDC_CLIENT_ID || 'redash-cli';
+const TEST_OIDC_CLIENT_ID = process.env.REDASH_OIDC_CLIENT_ID || 'redash-api';
 const TEST_OIDC_TOKEN_CACHE_PATH = process.env.REDASH_OIDC_TOKEN_CACHE_PATH || '';
 
 export default defineConfig({

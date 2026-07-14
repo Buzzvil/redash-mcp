@@ -78,9 +78,9 @@ a browser — instead, it reads the cached tokens left behind by
 3. Create a `.env` file with your Redash + OIDC configuration:
    ```env
    REDASH_URL=https://redash-dev.buzzvil.dev
-   REDASH_OIDC_ISSUER=https://authentik.buzzvil.com/application/o/redash-cli/
-   REDASH_OIDC_CLIENT_ID=redash-cli
-   REDASH_OIDC_AUDIENCE=redash-cli
+   REDASH_OIDC_ISSUER=https://authentik.buzzvil.com/application/o/redash-api/
+   REDASH_OIDC_CLIENT_ID=redash-api
+   REDASH_OIDC_AUDIENCE=redash-api
    # Optional: Cloudflare Access (or other gateway) headers
    # REDASH_EXTRA_HEADERS='{"CF-Access-Client-Id":"<client_id>","CF-Access-Client-Secret":"<client_secret>"}'
    ```
@@ -127,8 +127,8 @@ To use this MCP server with Claude for Desktop, configure it in your Claude for 
       "args": ["-y", "@suthio/redash-mcp"],
       "env": {
         "REDASH_URL": "https://redash.example.com",
-        "REDASH_OIDC_ISSUER": "https://authentik.example.com/application/o/redash-cli/",
-        "REDASH_OIDC_CLIENT_ID": "redash-cli"
+        "REDASH_OIDC_ISSUER": "https://authentik.example.com/application/o/redash-api/",
+        "REDASH_OIDC_CLIENT_ID": "redash-api"
       }
     }
   }
@@ -221,7 +221,7 @@ To migrate:
 
 1. Configure the OIDC client on the IdP side (public, PKCE-required, loopback
    redirect URI). For Buzzvil's setup see
-   [`buzz-k8s-resources/argo-cd/buzzvil-eks-ops/manifests/authentik/blueprint-redash-cli.yaml`](https://github.com/Buzzvil/buzz-k8s-resources).
+   [`buzz-k8s-resources/argo-cd/buzzvil-eks-ops/manifests/authentik/blueprint-redash-api.yaml`](https://github.com/Buzzvil/buzz-k8s-resources).
 2. Drop `REDASH_API_KEY` from your `.env` / Claude Desktop config.
 3. Add `REDASH_OIDC_ISSUER` and `REDASH_OIDC_CLIENT_ID`.
 4. Run `redash-mcp login` once.

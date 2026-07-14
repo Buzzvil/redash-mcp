@@ -13,8 +13,8 @@ if (existsSync(envPath)) {
 function printAuthEnvUsage(stream: NodeJS.WriteStream = process.stderr): void {
   stream.write(`Required environment variables:
   REDASH_URL              e.g. https://redash.example.com
-  REDASH_OIDC_ISSUER      e.g. https://authentik.example.com/application/o/redash-cli/
-  REDASH_OIDC_CLIENT_ID   e.g. redash-cli
+  REDASH_OIDC_ISSUER      e.g. https://authentik.example.com/application/o/redash-api/
+  REDASH_OIDC_CLIENT_ID   e.g. redash-api
 
 Optional:
   REDASH_OIDC_AUDIENCE    defaults to REDASH_OIDC_CLIENT_ID

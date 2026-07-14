@@ -35,8 +35,8 @@ beforeEach(() => {
   process.env = {
     ...ORIGINAL_ENV,
     REDASH_OIDC_ISSUER: 'https://idp.example.com',
-    REDASH_OIDC_CLIENT_ID: 'redash-cli',
-    REDASH_OIDC_AUDIENCE: 'redash-cli',
+    REDASH_OIDC_CLIENT_ID: 'redash-api',
+    REDASH_OIDC_AUDIENCE: 'redash-api',
     REDASH_OIDC_SCOPES: 'openid email offline_access',
   };
   jest.clearAllMocks();
@@ -61,7 +61,7 @@ describe('loadOidcConfig', () => {
     delete process.env.REDASH_OIDC_AUDIENCE;
     const cfg = loadOidcConfig();
     expect(cfg.issuer).toBe('https://idp.example.com');
-    expect(cfg.audience).toBe('redash-cli');
+    expect(cfg.audience).toBe('redash-api');
   });
 });
 
@@ -86,7 +86,7 @@ describe('getValidTokens', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'fresh', refreshToken: 'r', expiresAt: Date.now() + 600_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
     const tokens = await getValidTokens({ cachePath: cache });
     expect(tokens.accessToken).toBe('fresh');
@@ -99,7 +99,7 @@ describe('getValidTokens', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'x', expiresAt: Date.now() + 600_000,
-      issuer: 'https://other.example.com', clientId: 'redash-cli',
+      issuer: 'https://other.example.com', clientId: 'redash-api',
     }));
     await expect(getValidTokens({ cachePath: cache })).rejects.toThrow(/different OIDC client/);
   });
@@ -109,7 +109,7 @@ describe('getValidTokens', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'expired', refreshToken: 'rt', expiresAt: Date.now() - 1_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
 
     mockedAxios.get.mockResolvedValueOnce({
@@ -135,7 +135,7 @@ describe('getValidTokens', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'expired', expiresAt: Date.now() - 1_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
     await expect(getValidTokens({ cachePath: cache })).rejects.toThrow(/refresh_token/);
   });
@@ -145,7 +145,7 @@ describe('getValidTokens', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'expired', refreshToken: 'rt-original', expiresAt: Date.now() - 1_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
 
     mockedAxios.get.mockResolvedValueOnce({
@@ -169,7 +169,7 @@ describe('forceRefresh', () => {
     await fs.mkdir(path.dirname(cache), { recursive: true });
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'x', expiresAt: Date.now() + 60_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
     await expect(forceRefresh({ cachePath: cache })).rejects.toThrow(/refresh_token/);
   });
@@ -203,7 +203,7 @@ describe('readStatus', () => {
     await fs.writeFile(cache, JSON.stringify({
       accessToken: 'opaque', idToken: `h.${payload}.sig`,
       expiresAt: Date.now() + 60_000,
-      issuer: 'https://idp.example.com', clientId: 'redash-cli',
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
     }));
     const status = await readStatus({ cachePath: cache });
     expect(status.hasTokens).toBe(true);

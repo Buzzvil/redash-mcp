@@ -1,7 +1,7 @@
 // Set environment variables before any imports
 process.env.REDASH_URL = 'https://redash.example.com';
 process.env.REDASH_OIDC_ISSUER = 'https://idp.example.com';
-process.env.REDASH_OIDC_CLIENT_ID = 'redash-cli';
+process.env.REDASH_OIDC_CLIENT_ID = 'redash-api';
 process.env.REDASH_TIMEOUT = '30000';
 
 import { jest } from '@jest/globals';
@@ -22,19 +22,19 @@ jest.mock('../auth.js', () => ({
     accessToken: 'test-access-token',
     expiresAt: Date.now() + 60_000,
     issuer: 'https://idp.example.com',
-    clientId: 'redash-cli',
+    clientId: 'redash-api',
   }),
   ensureValidTokens: jest.fn<any>().mockResolvedValue({
     accessToken: 'test-access-token',
     expiresAt: Date.now() + 60_000,
     issuer: 'https://idp.example.com',
-    clientId: 'redash-cli',
+    clientId: 'redash-api',
   }),
   forceRefresh: jest.fn<any>().mockResolvedValue({
     accessToken: 'refreshed-access-token',
     expiresAt: Date.now() + 60_000,
     issuer: 'https://idp.example.com',
-    clientId: 'redash-cli',
+    clientId: 'redash-api',
   }),
   performLogout: jest.fn<any>().mockResolvedValue(undefined),
 }));
@@ -59,7 +59,7 @@ describe('RedashClient', () => {
   beforeEach(() => {
     process.env.REDASH_URL = 'https://redash.example.com';
     process.env.REDASH_OIDC_ISSUER = 'https://idp.example.com';
-    process.env.REDASH_OIDC_CLIENT_ID = 'redash-cli';
+    process.env.REDASH_OIDC_CLIENT_ID = 'redash-api';
     process.env.REDASH_TIMEOUT = '30000';
     delete process.env.REDASH_EXTRA_HEADERS;
 
