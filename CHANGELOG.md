@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.1.0](https://github.com/Buzzvil/redash-mcp/commits/v0.1.0) - 2026-07-31
+
+- feat!: OIDC device flow 인증으로 API key 인증 대체 by @dlddu in https://github.com/Buzzvil/redash-mcp/pull/1
+
 ## [v0.0.13](https://github.com/suthio/redash-mcp/compare/v0.0.12...v0.0.13) - 2026-03-26
 - Add get_dashboard_by_slug tool for slug-based dashboard lookup by @ryo-imai-bit in https://github.com/suthio/redash-mcp/pull/41
 - Add Dependabot for automated npm and GitHub Actions updates by @suthio in https://github.com/suthio/redash-mcp/pull/37
