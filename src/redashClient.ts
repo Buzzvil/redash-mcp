@@ -1,6 +1,7 @@
-import axios, { AxiosInstance, AxiosError } from 'axios';
+import axios, { AxiosInstance, AxiosError, InternalAxiosRequestConfig } from 'axios';
 import * as dotenv from 'dotenv';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { AuthError, forceRefresh, getValidTokens, makeLoginRequiredError, performLogout } from './auth.js';
 import { logger } from './logger.js';
 
 dotenv.config();
@@ -263,24 +264,18 @@ export interface RedashDestination {
 export class RedashClient {
   private client: AxiosInstance;
   private baseUrl: string;
-  private apiKey: string;
 
   constructor() {
     this.baseUrl = process.env.REDASH_URL || '';
-    this.apiKey = process.env.REDASH_API_KEY || '';
 
-    if (!this.baseUrl || !this.apiKey) {
-      throw new Error('REDASH_URL and REDASH_API_KEY must be provided in .env file');
+    if (!this.baseUrl) {
+      throw new Error('REDASH_URL must be set in the environment');
     }
-
-    const defaultHeaders: Record<string, string> = {
-      'Authorization': `Key ${this.apiKey}`,
-      'Content-Type': 'application/json'
-    };
 
     const extraHeaders = this.parseExtraHeaders();
 
-    // Prevent accidental override of Authorization header
+    // The Authorization header is injected per-request from the OIDC token
+    // cache; reject any caller attempt to override it via REDASH_EXTRA_HEADERS.
     if (extraHeaders['Authorization'] || extraHeaders['authorization']) {
       delete extraHeaders['Authorization'];
       delete extraHeaders['authorization'];
@@ -289,7 +284,7 @@ export class RedashClient {
     const axiosConfig: Record<string, unknown> = {
       baseURL: this.baseUrl,
       headers: {
-        ...defaultHeaders,
+        'Content-Type': 'application/json',
         ...extraHeaders,
       },
       timeout: parseInt(process.env.REDASH_TIMEOUT || '30000')
@@ -303,6 +298,51 @@ export class RedashClient {
     }
 
     this.client = axios.create(axiosConfig);
+
+    // Guard against the jest auto-mock case where axios.create() returns
+    // undefined (happens for the module-load singleton before tests install
+    // their own mockReturnValue). Tests that exercise the client install a
+    // proper mock first, so they get the interceptors.
+    if (!this.client?.interceptors) {
+      return;
+    }
+
+    // Attach the current OIDC access token to every outbound request. The
+    // tool dispatcher in index.ts is responsible for surfacing login prompts
+    // before reaching here; by this point a cached token should exist (or
+    // getValidTokens throws AuthError which bubbles up as a fatal error).
+    // We additionally retry once on 401 in case the IdP rotated/revoked the
+    // token sooner than its stated expiry — forceRefresh handles that path.
+    this.client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
+      const tokens = await getValidTokens();
+      config.headers = config.headers ?? {};
+      (config.headers as any).set?.('Authorization', `Bearer ${tokens.accessToken}`)
+        ?? ((config.headers as any).Authorization = `Bearer ${tokens.accessToken}`);
+      return config;
+    });
+
+    this.client.interceptors.response.use(undefined, async (error: AxiosError & { config?: InternalAxiosRequestConfig & { _retried?: boolean } }) => {
+      const status = error.response?.status;
+      const cfg = error.config;
+      if (status === 401 && cfg && !cfg._retried) {
+        cfg._retried = true;
+        try {
+          const refreshed = await forceRefresh();
+          cfg.headers = cfg.headers ?? {};
+          (cfg.headers as any).set?.('Authorization', `Bearer ${refreshed.accessToken}`)
+            ?? ((cfg.headers as any).Authorization = `Bearer ${refreshed.accessToken}`);
+          return this.client.request(cfg);
+        } catch (refreshErr) {
+          if (!(refreshErr instanceof AuthError)) throw refreshErr;
+          // Refresh failed (no refresh_token / revoked / IdP rotated us out).
+          // Wipe the stale cache and surface a fresh login URL so the
+          // assistant can prompt the user via the same path as a cold start.
+          await performLogout().catch(() => {});
+          throw await makeLoginRequiredError('Authorization expired and could not be refreshed.');
+        }
+      }
+      throw error;
+    });
   }
 
   // Parse extra headers from env var `REDASH_EXTRA_HEADERS`.
@@ -350,6 +390,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching queries: ${error}`);
       throw new Error('Failed to fetch queries from Redash');
     }
@@ -361,6 +402,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/queries/${queryId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(`Error fetching query ${queryId}:`, error);
       throw new Error(`Failed to fetch query ${queryId} from Redash`);
     }
@@ -411,6 +453,7 @@ export class RedashClient {
         }
       }
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error creating query: ${error instanceof Error ? error.message : String(error)}`);
       logger.error(`Stack trace: ${error instanceof Error && error.stack ? error.stack : 'No stack trace available'}`);
       throw new Error(`Failed to create query: ${error instanceof Error ? error.message : String(error)}`);
@@ -460,6 +503,7 @@ export class RedashClient {
         }
       }
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error updating query ${queryId}: ${error}`);
       throw new Error(`Failed to update query ${queryId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -473,6 +517,7 @@ export class RedashClient {
       logger.debug(`Archived query ${queryId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error archiving query ${queryId}: ${error}`);
       throw new Error(`Failed to archive query ${queryId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -484,6 +529,7 @@ export class RedashClient {
       const response = await this.client.get('/api/data_sources');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching data sources: ${error}`);
       throw new Error('Failed to fetch data sources from Redash');
     }
@@ -501,6 +547,7 @@ export class RedashClient {
 
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       if (axios.isAxiosError(error)) {
         const axiosError = error as AxiosError;
         logger.error(`Error executing query ${queryId}: ${axiosError.message}`);
@@ -550,6 +597,7 @@ export class RedashClient {
         // Wait for the next poll
         await new Promise(resolve => setTimeout(resolve, interval));
       } catch (error) {
+        if (error instanceof AuthError) throw error;
         // If this is our own error from status 4, re-throw it as-is
         if (error instanceof Error && error.message.startsWith('Query execution failed:')) {
           throw error;
@@ -596,6 +644,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error('Error fetching dashboards:', error);
       throw new Error('Failed to fetch dashboards from Redash');
     }
@@ -607,6 +656,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/dashboards/${dashboardId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(`Error fetching dashboard ${dashboardId}:`, error);
       throw new Error(`Failed to fetch dashboard ${dashboardId} from Redash`);
     }
@@ -620,6 +670,7 @@ export class RedashClient {
       });
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching dashboard by slug '${slug}': ${error}`);
       throw new Error(`Failed to fetch dashboard by slug '${slug}' from Redash`);
     }
@@ -631,6 +682,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/visualizations/${visualizationId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(`Error fetching visualization ${visualizationId}:`, error);
       throw new Error(`Failed to fetch visualization ${visualizationId} from Redash`);
     }
@@ -664,6 +716,7 @@ export class RedashClient {
       return response.data;
 
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error executing adhoc query: ${error}`);
       throw new Error(`Failed to execute adhoc query: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -675,6 +728,7 @@ export class RedashClient {
       const response = await this.client.post('/api/visualizations', data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error('Error creating visualization:', error);
       throw new Error('Failed to create visualization');
     }
@@ -686,6 +740,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/visualizations/${visualizationId}`, data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(`Error updating visualization ${visualizationId}:`, error);
       throw new Error(`Failed to update visualization ${visualizationId}`);
     }
@@ -696,6 +751,7 @@ export class RedashClient {
     try {
       await this.client.delete(`/api/visualizations/${visualizationId}`);
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(`Error deleting visualization ${visualizationId}:`, error);
       throw new Error(`Failed to delete visualization ${visualizationId}`);
     }
@@ -717,6 +773,7 @@ export class RedashClient {
 
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       if (axios.isAxiosError(error)) {
         const axiosError = error as AxiosError;
         logger.error(`Error fetching CSV results for query ${queryId}: ${axiosError.message}`);
@@ -746,6 +803,7 @@ export class RedashClient {
       );
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       console.error(
         `Error fetching data source ${dataSourceId} schema:`,
         error
@@ -764,6 +822,7 @@ export class RedashClient {
       const response = await this.client.post('/api/dashboards', data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error creating dashboard: ${error}`);
       throw new Error(`Failed to create dashboard: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -775,6 +834,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/dashboards/${dashboardId}`, data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error updating dashboard ${dashboardId}: ${error}`);
       throw new Error(`Failed to update dashboard ${dashboardId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -786,6 +846,7 @@ export class RedashClient {
       await this.client.delete(`/api/dashboards/${dashboardId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error archiving dashboard ${dashboardId}: ${error}`);
       throw new Error(`Failed to archive dashboard ${dashboardId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -797,6 +858,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/dashboards/${dashboardId}/fork`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error forking dashboard ${dashboardId}: ${error}`);
       throw new Error(`Failed to fork dashboard ${dashboardId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -808,6 +870,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/dashboards/public/${token}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching public dashboard: ${error}`);
       throw new Error(`Failed to fetch public dashboard: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -819,6 +882,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/dashboards/${dashboardId}/share`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error sharing dashboard ${dashboardId}: ${error}`);
       throw new Error(`Failed to share dashboard ${dashboardId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -830,6 +894,7 @@ export class RedashClient {
       await this.client.delete(`/api/dashboards/${dashboardId}/share`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error unsharing dashboard ${dashboardId}: ${error}`);
       throw new Error(`Failed to unshare dashboard ${dashboardId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -848,6 +913,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching my dashboards: ${error}`);
       throw new Error(`Failed to fetch my dashboards: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -866,6 +932,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching favorite dashboards: ${error}`);
       throw new Error(`Failed to fetch favorite dashboards: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -877,6 +944,7 @@ export class RedashClient {
       await this.client.post(`/api/dashboards/${dashboardId}/favorite`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error adding dashboard ${dashboardId} to favorites: ${error}`);
       throw new Error(`Failed to add dashboard ${dashboardId} to favorites: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -888,6 +956,7 @@ export class RedashClient {
       await this.client.delete(`/api/dashboards/${dashboardId}/favorite`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error removing dashboard ${dashboardId} from favorites: ${error}`);
       throw new Error(`Failed to remove dashboard ${dashboardId} from favorites: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -899,6 +968,7 @@ export class RedashClient {
       const response = await this.client.get('/api/dashboards/tags');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching dashboard tags: ${error}`);
       throw new Error(`Failed to fetch dashboard tags: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -912,6 +982,7 @@ export class RedashClient {
       const response = await this.client.get('/api/alerts');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching alerts: ${error}`);
       throw new Error(`Failed to fetch alerts: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -923,6 +994,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/alerts/${alertId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching alert ${alertId}: ${error}`);
       throw new Error(`Failed to fetch alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -934,6 +1006,7 @@ export class RedashClient {
       const response = await this.client.post('/api/alerts', data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error creating alert: ${error}`);
       throw new Error(`Failed to create alert: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -945,6 +1018,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/alerts/${alertId}`, data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error updating alert ${alertId}: ${error}`);
       throw new Error(`Failed to update alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -956,6 +1030,7 @@ export class RedashClient {
       await this.client.delete(`/api/alerts/${alertId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error deleting alert ${alertId}: ${error}`);
       throw new Error(`Failed to delete alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -967,6 +1042,7 @@ export class RedashClient {
       await this.client.post(`/api/alerts/${alertId}/mute`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error muting alert ${alertId}: ${error}`);
       throw new Error(`Failed to mute alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -978,6 +1054,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/alerts/${alertId}/subscriptions`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching alert ${alertId} subscriptions: ${error}`);
       throw new Error(`Failed to fetch alert ${alertId} subscriptions: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -989,6 +1066,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/alerts/${alertId}/subscriptions`, data || {});
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error adding subscription to alert ${alertId}: ${error}`);
       throw new Error(`Failed to add subscription to alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1000,6 +1078,7 @@ export class RedashClient {
       await this.client.delete(`/api/alerts/${alertId}/subscriptions/${subscriptionId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error removing subscription ${subscriptionId} from alert ${alertId}: ${error}`);
       throw new Error(`Failed to remove subscription ${subscriptionId} from alert ${alertId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1013,6 +1092,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/queries/${queryId}/fork`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error forking query ${queryId}: ${error}`);
       throw new Error(`Failed to fork query ${queryId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1031,6 +1111,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching my queries: ${error}`);
       throw new Error(`Failed to fetch my queries: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1049,6 +1130,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching recent queries: ${error}`);
       throw new Error(`Failed to fetch recent queries: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1060,6 +1142,7 @@ export class RedashClient {
       const response = await this.client.get('/api/queries/tags');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching query tags: ${error}`);
       throw new Error(`Failed to fetch query tags: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1078,6 +1161,7 @@ export class RedashClient {
         results: response.data.results
       };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching favorite queries: ${error}`);
       throw new Error(`Failed to fetch favorite queries: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1089,6 +1173,7 @@ export class RedashClient {
       await this.client.post(`/api/queries/${queryId}/favorite`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error adding query ${queryId} to favorites: ${error}`);
       throw new Error(`Failed to add query ${queryId} to favorites: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1100,6 +1185,7 @@ export class RedashClient {
       await this.client.delete(`/api/queries/${queryId}/favorite`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error removing query ${queryId} from favorites: ${error}`);
       throw new Error(`Failed to remove query ${queryId} from favorites: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1113,6 +1199,7 @@ export class RedashClient {
       const response = await this.client.get('/api/widgets');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching widgets: ${error}`);
       throw new Error(`Failed to fetch widgets: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1124,6 +1211,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/widgets/${widgetId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching widget ${widgetId}: ${error}`);
       throw new Error(`Failed to fetch widget ${widgetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1135,6 +1223,7 @@ export class RedashClient {
       const response = await this.client.post('/api/widgets', data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error creating widget: ${error}`);
       throw new Error(`Failed to create widget: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1146,6 +1235,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/widgets/${widgetId}`, data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error updating widget ${widgetId}: ${error}`);
       throw new Error(`Failed to update widget ${widgetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1157,6 +1247,7 @@ export class RedashClient {
       await this.client.delete(`/api/widgets/${widgetId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error deleting widget ${widgetId}: ${error}`);
       throw new Error(`Failed to delete widget ${widgetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1170,6 +1261,7 @@ export class RedashClient {
       const response = await this.client.get('/api/query_snippets');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching query snippets: ${error}`);
       throw new Error(`Failed to fetch query snippets: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1181,6 +1273,7 @@ export class RedashClient {
       const response = await this.client.get(`/api/query_snippets/${snippetId}`);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching query snippet ${snippetId}: ${error}`);
       throw new Error(`Failed to fetch query snippet ${snippetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1192,6 +1285,7 @@ export class RedashClient {
       const response = await this.client.post('/api/query_snippets', data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error creating query snippet: ${error}`);
       throw new Error(`Failed to create query snippet: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1203,6 +1297,7 @@ export class RedashClient {
       const response = await this.client.post(`/api/query_snippets/${snippetId}`, data);
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error updating query snippet ${snippetId}: ${error}`);
       throw new Error(`Failed to update query snippet ${snippetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1214,6 +1309,7 @@ export class RedashClient {
       await this.client.delete(`/api/query_snippets/${snippetId}`);
       return { success: true };
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error deleting query snippet ${snippetId}: ${error}`);
       throw new Error(`Failed to delete query snippet ${snippetId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1227,6 +1323,7 @@ export class RedashClient {
       const response = await this.client.get('/api/destinations');
       return response.data;
     } catch (error) {
+      if (error instanceof AuthError) throw error;
       logger.error(`Error fetching destinations: ${error}`);
       throw new Error(`Failed to fetch destinations: ${error instanceof Error ? error.message : String(error)}`);
     }
