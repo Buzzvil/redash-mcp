@@ -1,5 +1,5 @@
 {
-  "name": "@suthio/redash-mcp",
+  "name": "@buzzvil/redash-mcp",
   "version": "0.1.0",
   "description": "MCP server for Redash integration",
   "type": "module",
@@ -30,6 +30,13 @@
   ],
   "author": "",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Buzzvil/redash-mcp.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.1.0",
     "axios": "^1.6.2",

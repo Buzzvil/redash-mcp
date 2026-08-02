@@ -66,6 +66,40 @@ a browser — instead, it reads the cached tokens left behind by
 
 ## Installation
 
+### Run with npx from GitHub Packages
+
+GitHub Packages requires npm authentication even for public packages. Create a
+classic personal access token with only the `read:packages` scope, then sign in
+once (use your GitHub username and the token as the password):
+
+```bash
+npm login --scope=@buzzvil --auth-type=legacy --registry=https://npm.pkg.github.com
+```
+
+Set the required Redash/OIDC environment variables, then log in to Redash and
+run the MCP server:
+
+```bash
+export REDASH_URL=https://redash.example.com
+export REDASH_OIDC_ISSUER=https://authentik.example.com/application/o/redash-api/
+export REDASH_OIDC_CLIENT_ID=redash-api
+
+npx -y @buzzvil/redash-mcp login
+npx -y @buzzvil/redash-mcp
+```
+
+For non-interactive environments, map the scope and token in `~/.npmrc`:
+
+```ini
+@buzzvil:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
+```
+
+GitHub Packages does not support anonymous npm installs, including for public
+packages. Authentication-free `npx` requires publishing to npmjs.org as well.
+
+### Build from source
+
 1. Clone this repository:
    ```bash
    git clone https://github.com/Buzzvil/redash-mcp.git
@@ -91,7 +125,7 @@ a browser — instead, it reads the cached tokens left behind by
 5. **Log in once** — opens your browser, completes PKCE, writes tokens to the cache:
    ```bash
    npm start -- login
-   # or, after publish: npx @suthio/redash-mcp login
+   # or, from GitHub Packages: npx -y @buzzvil/redash-mcp login
    ```
 6. Start the server:
    ```bash
@@ -124,7 +158,7 @@ To use this MCP server with Claude for Desktop, configure it in your Claude for 
   "mcpServers": {
     "redash": {
       "command": "npx",
-      "args": ["-y", "@suthio/redash-mcp"],
+      "args": ["-y", "@buzzvil/redash-mcp"],
       "env": {
         "REDASH_URL": "https://redash.example.com",
         "REDASH_OIDC_ISSUER": "https://authentik.example.com/application/o/redash-api/",
