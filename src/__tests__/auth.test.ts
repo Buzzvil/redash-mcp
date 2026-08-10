@@ -18,9 +18,12 @@ import {
   AuthError,
   forceRefresh,
   getValidTokens,
+  initializeAuth,
   loadOidcConfig,
   performLogout,
   readStatus,
+  shutdownAuth,
+  startPendingLogin,
   tokenCachePath,
 } from '../auth.js';
 
@@ -31,7 +34,19 @@ async function mktmp(): Promise<string> {
   return path.join(dir, 'tokens.json');
 }
 
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
+  initializeAuth();
   process.env = {
     ...ORIGINAL_ENV,
     REDASH_OIDC_ISSUER: 'https://idp.example.com',
@@ -42,7 +57,8 @@ beforeEach(() => {
   jest.clearAllMocks();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await shutdownAuth();
   process.env = { ...ORIGINAL_ENV };
 });
 
@@ -72,6 +88,55 @@ describe('tokenCachePath', () => {
 
   it('uses XDG_STATE_HOME when set', () => {
     expect(tokenCachePath({ XDG_STATE_HOME: '/x/state' } as any)).toBe('/x/state/redash-mcp/tokens.json');
+  });
+});
+
+describe('pending device login', () => {
+  it('shares one startup across concurrent callers and aborts it on shutdown', async () => {
+    const cache = await mktmp();
+    mockedAxios.get.mockResolvedValueOnce({
+      data: {
+        token_endpoint: 'https://idp.example.com/token',
+        device_authorization_endpoint: 'https://idp.example.com/device',
+      },
+    } as any);
+    mockedAxios.post.mockResolvedValueOnce({
+      data: {
+        device_code: 'device-code',
+        user_code: 'ABCD-EFGH',
+        verification_uri: 'https://idp.example.com/activate',
+        verification_uri_complete: 'https://idp.example.com/activate?code=ABCD-EFGH',
+        expires_in: 600,
+        interval: 60,
+      },
+    } as any);
+
+    const [first, second] = await Promise.all([
+      startPendingLogin({ cachePath: cache }),
+      startPendingLogin({ cachePath: cache }),
+    ]);
+
+    expect(first).toEqual(second);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    const requestSignal = (mockedAxios.post.mock.calls[0][2] as { signal: AbortSignal }).signal;
+    expect(requestSignal.aborted).toBe(false);
+
+    await shutdownAuth();
+    expect(requestSignal.aborted).toBe(true);
+  });
+
+  it('does not restart auth work after shutdown until a new lifecycle starts', async () => {
+    const cache = await mktmp();
+    await shutdownAuth();
+
+    await expect(startPendingLogin({ cachePath: cache }))
+      .rejects.toThrow(/cancelled during shutdown/);
+    expect(mockedAxios.get).not.toHaveBeenCalled();
+    expect(mockedAxios.post).not.toHaveBeenCalled();
+
+    initializeAuth();
+    await expect(getValidTokens({ cachePath: cache })).rejects.toThrow(/No cached OIDC tokens/);
   });
 });
 
@@ -128,6 +193,41 @@ describe('getValidTokens', () => {
 
     const persisted = JSON.parse(await fs.readFile(cache, 'utf8'));
     expect(persisted.accessToken).toBe('new');
+  });
+
+  it('shares one refresh across concurrent automatic and forced refreshes', async () => {
+    const cache = await mktmp();
+    await fs.mkdir(path.dirname(cache), { recursive: true });
+    await fs.writeFile(cache, JSON.stringify({
+      accessToken: 'expired', refreshToken: 'rotating-refresh', expiresAt: Date.now() - 1_000,
+      issuer: 'https://idp.example.com', clientId: 'redash-api',
+    }));
+
+    mockedAxios.get.mockResolvedValueOnce({
+      data: { token_endpoint: 'https://idp.example.com/token' },
+    } as any);
+    const refreshStarted = deferred<void>();
+    const refreshResponse = deferred<any>();
+    mockedAxios.post.mockImplementationOnce(() => {
+      refreshStarted.resolve();
+      return refreshResponse.promise;
+    });
+
+    const automatic = getValidTokens({ cachePath: cache });
+    const forced = forceRefresh({ cachePath: cache });
+    await refreshStarted.promise;
+
+    expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
+    refreshResponse.resolve({
+      data: { access_token: 'shared-new', refresh_token: 'rotated-refresh', expires_in: 600 },
+    });
+
+    const [automaticTokens, forcedTokens] = await Promise.all([automatic, forced]);
+    expect(automaticTokens.accessToken).toBe('shared-new');
+    expect(forcedTokens).toEqual(automaticTokens);
+    expect(mockedAxios.get).toHaveBeenCalledTimes(1);
+    expect(mockedAxios.post).toHaveBeenCalledTimes(1);
   });
 
   it('throws when token expired and no refresh token available', async () => {
