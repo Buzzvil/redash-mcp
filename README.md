@@ -8,7 +8,8 @@ Model Context Protocol (MCP) server for integrating Redash with AI assistants li
 
 ## Features
 
-- Connect to Redash instances using **OIDC + PKCE browser login** (no long-lived API keys)
+- Connect to Redash instances using the **OIDC Device Authorization Grant** (no long-lived API keys)
+- Run locally over stdio or remotely over stateless **Streamable HTTP**
 - List available queries and dashboards as resources
 - Execute queries and retrieve results
 - Execute saved parameterized queries with typed values and saved defaults
@@ -23,8 +24,7 @@ Model Context Protocol (MCP) server for integrating Redash with AI assistants li
 
 This server **no longer accepts a Redash API key**. All API requests are
 authenticated with a short-lived OIDC access token obtained from your IdP
-(Authentik, Auth0, Keycloak, Okta, …) using the **Authorization Code + PKCE**
-flow.
+(Authentik, Auth0, Keycloak, Okta, …) using the **Device Authorization Grant**.
 
 Why this change:
 
@@ -36,18 +36,19 @@ Why this change:
   [`Buzzvil/redash-custom`](https://github.com/Buzzvil/redash-custom)
   (`docs/oidc-pkce-api-access.md`).
 
-Login is a separate one-time CLI command. The MCP server itself never opens
-a browser — instead, it reads the cached tokens left behind by
-`redash-mcp login` and refreshes them silently when they near expiry.
+You can authenticate ahead of time with the one-time `redash-mcp login`
+command. If no token is cached, the first tool call starts device
+authorization and returns a verification URL; the client can then call
+`wait_for_oidc_login`. Cached tokens are refreshed silently when they near
+expiry.
 
 ## Prerequisites
 
-- Node.js (v18 or later)
+- Node.js (v20 or later)
 - npm or yarn
 - A Redash instance with OIDC Bearer API auth enabled (see
   [`Buzzvil/redash-custom/docs/oidc-pkce-api-access.md`](https://github.com/Buzzvil/redash-custom/blob/main/docs/oidc-pkce-api-access.md))
-- An OIDC client registered as **public** with **PKCE required** and a
-  loopback redirect URI like `http://127.0.0.1:*/callback`
+- An OIDC public client with the Device Authorization Grant enabled
 
 ## Environment Variables
 
@@ -56,13 +57,20 @@ a browser — instead, it reads the cached tokens left behind by
 | `REDASH_URL` | yes | Your Redash instance URL (e.g. `https://redash.example.com`). |
 | `REDASH_OIDC_ISSUER` | yes | OIDC issuer URL. Discovery hits `<issuer>/.well-known/openid-configuration`. |
 | `REDASH_OIDC_CLIENT_ID` | yes | Public OIDC client identifier. |
-| `REDASH_OIDC_AUDIENCE` | no | Override the `audience` PKCE parameter. Defaults to `REDASH_OIDC_CLIENT_ID`. |
+| `REDASH_OIDC_AUDIENCE` | no | Override the `audience` authorization parameter. Defaults to `REDASH_OIDC_CLIENT_ID`. |
 | `REDASH_OIDC_SCOPES` | no | Scopes to request. Default: `openid email offline_access`. Drop `offline_access` only if your IdP doesn't issue refresh tokens. |
 | `REDASH_OIDC_TOKEN_CACHE_PATH` | no | Override the path of the token cache file. Default: `$XDG_STATE_HOME/redash-mcp/tokens.json` (or `~/.local/state/redash-mcp/tokens.json`). |
 | `REDASH_TIMEOUT` | no | API request timeout in ms (default `30000`). |
 | `REDASH_MAX_RESULTS` | no | Max results to return (default `1000`). |
 | `REDASH_EXTRA_HEADERS` | no | Extra HTTP headers as JSON object or `k=v;k2=v2` pairs. The `Authorization` header is reserved. |
 | `REDASH_SOCKS_PROXY` | no | SOCKS proxy URL (e.g. `socks5h://localhost:1080`). |
+| `MCP_TRANSPORT` | no | MCP transport: `stdio` (default) or `http`. |
+| `MCP_HTTP_HOST` | no | Streamable HTTP bind address (default `127.0.0.1`). |
+| `MCP_HTTP_PORT` | no | Streamable HTTP listen port (default `3000`). |
+| `MCP_HTTP_PATH` | no | MCP endpoint path (default `/mcp`). |
+| `MCP_HTTP_BODY_LIMIT` | no | Maximum JSON request size (default `1mb`). |
+| `MCP_HTTP_ALLOWED_HOSTS` | for non-loopback HTTP | Comma-separated hostname allowlist without ports, used for DNS rebinding protection. |
+| `MCP_HTTP_ALLOWED_ORIGINS` | no | Comma-separated exact Origin allowlist. Requests without an Origin header are accepted. |
 
 ## Installation
 
@@ -88,12 +96,12 @@ a browser — instead, it reads the cached tokens left behind by
    ```bash
    npm run build
    ```
-5. **Log in once** — opens your browser, completes PKCE, writes tokens to the cache:
+5. **Log in once** — opens the verification page (or prints its URL and code), then writes tokens to the cache:
    ```bash
    npm start -- login
    # or, after publish: npx @suthio/redash-mcp login
    ```
-6. Start the server:
+6. Start the stdio server:
    ```bash
    npm start
    ```
@@ -101,12 +109,59 @@ a browser — instead, it reads the cached tokens left behind by
 ## Subcommands
 
 ```
-redash-mcp [serve]    Start the MCP server (default). Requires a prior `login`.
-redash-mcp login      Run the OIDC PKCE browser flow and cache tokens.
+redash-mcp [serve]    Start the MCP server over stdio (default).
+redash-mcp serve --transport http
+                      Start a stateless Streamable HTTP server.
+redash-mcp serve-http Alias for `serve --transport http`.
+redash-mcp login      Run the OIDC device authorization flow and cache tokens.
 redash-mcp logout     Clear the cached tokens.
 redash-mcp status     Show cached token info (email, expiry).
 redash-mcp help       Show help.
 ```
+
+## Streamable HTTP
+
+The default transport remains stdio for desktop and IDE integrations. To run
+the same tools over the modern Streamable HTTP transport:
+
+```bash
+npm run build
+npm run start:http
+# equivalent: npm start -- serve --transport http
+```
+
+The MCP endpoint is `http://127.0.0.1:3000/mcp`. A lightweight health check is
+available at `http://127.0.0.1:3000/health`.
+
+The Streamable HTTP transport is stateless: each POST gets an isolated MCP
+server and transport, so multiple clients can use it concurrently without
+shared MCP session storage. Legacy HTTP+SSE endpoints are not exposed.
+
+Authentication state is process-local. The pending OIDC device login and token
+cache are not shared between replicas. Use a single replica or sticky routing
+during device authorization, and securely pre-provision a token cache for each
+replica before scaling out. Replicas that share a rotating refresh token need
+external coordination to avoid concurrent refreshes.
+
+The server binds to loopback by default. Binding to a non-loopback interface
+requires an explicit hostname allowlist. List hostnames without ports:
+
+```bash
+MCP_HTTP_HOST=0.0.0.0 \
+MCP_HTTP_ALLOWED_HOSTS=mcp.example.com \
+npm run start:http
+```
+
+The OIDC token cache belongs to the server process, not to the incoming MCP
+client. Every HTTP caller therefore acts as the same cached Redash user. The
+server does not add inbound HTTP authentication; place any non-loopback
+deployment behind TLS and an authenticated reverse proxy. Requests carrying
+an `Origin` header are rejected unless that exact origin is listed in
+`MCP_HTTP_ALLOWED_ORIGINS`. This allowlist validates origins but does not
+enable CORS; configure browser-facing CORS at the reverse proxy.
+
+Set `MCP_HTTP_BODY_LIMIT` to change the maximum JSON request size (default:
+`1mb`; examples: `512kb`, `5mb`).
 
 ## Usage with Claude for Desktop
 
@@ -206,7 +261,7 @@ E2E tests need a valid cached OIDC token; point the harness at the cache via
 npm run inspector
 ```
 
-## Migration from v0.0.x (API key) to v0.1.x (OIDC PKCE)
+## Migration from v0.0.x (API key) to v0.1.x (OIDC device flow)
 
 Breaking changes:
 
@@ -219,8 +274,8 @@ Breaking changes:
 
 To migrate:
 
-1. Configure the OIDC client on the IdP side (public, PKCE-required, loopback
-   redirect URI). For Buzzvil's setup see
+1. Configure the OIDC client on the IdP side as a public client with the
+   Device Authorization Grant enabled. For Buzzvil's setup see
    [`buzz-k8s-resources/argo-cd/buzzvil-eks-ops/manifests/authentik/blueprint-redash-api.yaml`](https://github.com/Buzzvil/buzz-k8s-resources).
 2. Drop `REDASH_API_KEY` from your `.env` / Claude Desktop config.
 3. Add `REDASH_OIDC_ISSUER` and `REDASH_OIDC_CLIENT_ID`.
@@ -228,7 +283,7 @@ To migrate:
 
 ## Version History
 
-- v0.1.0: **Breaking** — replace API key auth with OIDC PKCE browser login.
+- v0.1.0: **Breaking** — replace API key auth with OIDC device authorization.
 - v0.0.13: parameterized query execution, dashboard layout tools, chart visualization config.
 - v0.0.12: Zod-driven tool schemas.
 - v0.0.11: dashboard by-slug lookup.

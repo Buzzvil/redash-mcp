@@ -56,6 +56,56 @@ export class AuthError extends Error {
   }
 }
 
+let authAbortController = new AbortController();
+const activeAuthOperations = new Set<Promise<unknown>>();
+
+/** Start a fresh auth lifecycle after a previous server completed shutdown. */
+export function initializeAuth(): void {
+  if (authAbortController.signal.aborted) {
+    authAbortController = new AbortController();
+  }
+}
+
+function authCancellationError(signal: AbortSignal): AuthError {
+  return signal.reason instanceof AuthError
+    ? signal.reason
+    : new AuthError('Authentication operation was cancelled', signal.reason);
+}
+
+function throwIfAuthAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw authCancellationError(signal);
+  }
+}
+
+function trackAuthOperation<T>(operation: Promise<T>): Promise<T> {
+  activeAuthOperations.add(operation);
+  void operation.then(
+    () => activeAuthOperations.delete(operation),
+    () => activeAuthOperations.delete(operation),
+  );
+  return operation;
+}
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  throwIfAuthAborted(signal);
+
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(authCancellationError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
 export function loadOidcConfig(env: NodeJS.ProcessEnv = process.env): OidcConfig {
   const issuer = (env.REDASH_OIDC_ISSUER || '').replace(/\/+$/, '');
   const clientId = env.REDASH_OIDC_CLIENT_ID || '';
@@ -103,15 +153,17 @@ async function clearTokenCache(file: string): Promise<void> {
   try { await fsp.unlink(file); } catch (err: any) { if (err?.code !== 'ENOENT') throw err; }
 }
 
-async function discover(issuer: string): Promise<DiscoveryDocument> {
+async function discover(issuer: string, signal: AbortSignal): Promise<DiscoveryDocument> {
   const url = `${issuer}/.well-known/openid-configuration`;
   try {
-    const { data } = await axios.get<DiscoveryDocument>(url, { timeout: 10_000 });
+    const { data } = await axios.get<DiscoveryDocument>(url, { timeout: 10_000, signal });
+    throwIfAuthAborted(signal);
     if (!data.token_endpoint) {
       throw new AuthError(`Discovery document at ${url} is missing token_endpoint`);
     }
     return data;
   } catch (err: any) {
+    if (signal.aborted) throw authCancellationError(signal);
     if (err instanceof AuthError) throw err;
     throw new AuthError(`OIDC discovery failed for ${url}: ${err?.message || err}`, err);
   }
@@ -156,6 +208,7 @@ interface DeviceCodeResponse {
 async function requestDeviceCode(
   deviceAuthEndpoint: string,
   params: { clientId: string; scopes: string; audience?: string },
+  signal: AbortSignal,
 ): Promise<DeviceCodeResponse> {
   const body = new URLSearchParams({
     client_id: params.clientId,
@@ -166,12 +219,15 @@ async function requestDeviceCode(
     const { data } = await axios.post<DeviceCodeResponse>(deviceAuthEndpoint, body.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
       timeout: 15_000,
+      signal,
     });
+    throwIfAuthAborted(signal);
     if (!data.device_code || !data.user_code || !data.verification_uri) {
       throw new AuthError('Device authorization response missing required fields');
     }
     return data;
   } catch (err: any) {
+    if (signal.aborted) throw authCancellationError(signal);
     if (err instanceof AuthError) throw err;
     const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
     throw new AuthError(`Device authorization request failed: ${detail}`, err);
@@ -181,6 +237,7 @@ async function requestDeviceCode(
 async function pollForDeviceToken(
   tokenEndpoint: string,
   params: { clientId: string; deviceCode: string; initialIntervalSec: number; expiresInSec: number },
+  signal: AbortSignal,
 ): Promise<TokenResponse> {
   const deadline = Date.now() + params.expiresInSec * 1000;
   let intervalMs = Math.max(params.initialIntervalSec, 1) * 1000;
@@ -191,13 +248,15 @@ async function pollForDeviceToken(
   });
 
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    await abortableDelay(intervalMs, signal);
     try {
       const { data } = await axios.post<TokenResponse>(tokenEndpoint, body.toString(), {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
         timeout: 15_000,
         validateStatus: () => true, // RFC 8628 signals pending/slow_down via 400
+        signal,
       });
+      throwIfAuthAborted(signal);
       if (data && (data as any).error === undefined && data.access_token) {
         return data;
       }
@@ -212,6 +271,7 @@ async function pollForDeviceToken(
       }
       throw new AuthError(`Device token poll failed: ${JSON.stringify(data)}`);
     } catch (err: any) {
+      if (signal.aborted) throw authCancellationError(signal);
       if (err instanceof AuthError) throw err;
       const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
       throw new AuthError(`Device token poll failed: ${detail}`, err);
@@ -223,6 +283,7 @@ async function pollForDeviceToken(
 async function refreshTokens(
   tokenEndpoint: string,
   params: { refreshToken: string; clientId: string; scopes: string },
+  signal: AbortSignal,
 ): Promise<TokenResponse> {
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -234,9 +295,12 @@ async function refreshTokens(
     const { data } = await axios.post<TokenResponse>(tokenEndpoint, body.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
       timeout: 15_000,
+      signal,
     });
+    throwIfAuthAborted(signal);
     return data;
   } catch (err: any) {
+    if (signal.aborted) throw authCancellationError(signal);
     const detail = err?.response?.data ? JSON.stringify(err.response.data) : err?.message;
     throw new AuthError(`Token refresh failed: ${detail}`, err);
   }
@@ -270,42 +334,51 @@ interface LoginFlowHandle {
  * user-facing URL + code immediately; await `completion` to receive cached
  * tokens once the user finishes browser-side authorization.
  */
-async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<LoginFlowHandle> {
-  const cfg = opts.cfg ?? loadOidcConfig();
-  const cache = opts.cachePath ?? tokenCachePath();
+function beginDeviceFlow(
+  opts: { cfg?: OidcConfig; cachePath?: string } = {},
+  signal: AbortSignal = authAbortController.signal,
+): Promise<LoginFlowHandle> {
+  return trackAuthOperation((async () => {
+    throwIfAuthAborted(signal);
+    const cfg = opts.cfg ?? loadOidcConfig();
+    const cache = opts.cachePath ?? tokenCachePath();
 
-  const discovery = await discover(cfg.issuer);
-  if (!discovery.device_authorization_endpoint) {
-    throw new AuthError(
-      `IdP discovery document at ${cfg.issuer} does not advertise device_authorization_endpoint. ` +
-      `Enable RFC 8628 device flow on the OIDC provider before using this MCP server.`,
-    );
-  }
+    const discovery = await discover(cfg.issuer, signal);
+    if (!discovery.device_authorization_endpoint) {
+      throw new AuthError(
+        `IdP discovery document at ${cfg.issuer} does not advertise device_authorization_endpoint. ` +
+        `Enable RFC 8628 device flow on the OIDC provider before using this MCP server.`,
+      );
+    }
 
-  const dc = await requestDeviceCode(discovery.device_authorization_endpoint, {
-    clientId: cfg.clientId,
-    scopes: cfg.scopes,
-    audience: cfg.audience,
-  });
-
-  const completion = (async () => {
-    const tokens = await pollForDeviceToken(discovery.token_endpoint, {
+    const dc = await requestDeviceCode(discovery.device_authorization_endpoint, {
       clientId: cfg.clientId,
-      deviceCode: dc.device_code,
-      initialIntervalSec: dc.interval || 5,
-      expiresInSec: dc.expires_in,
-    });
-    const cached = tokenResponseToCached(tokens, cfg);
-    await writeTokenCache(cache, cached);
-    return cached;
-  })();
+      scopes: cfg.scopes,
+      audience: cfg.audience,
+    }, signal);
+    throwIfAuthAborted(signal);
 
-  return {
-    url: dc.verification_uri_complete || dc.verification_uri,
-    userCode: dc.user_code,
-    completion,
-    expiresInSec: dc.expires_in,
-  };
+    const completion = trackAuthOperation((async () => {
+      const tokens = await pollForDeviceToken(discovery.token_endpoint, {
+        clientId: cfg.clientId,
+        deviceCode: dc.device_code,
+        initialIntervalSec: dc.interval || 5,
+        expiresInSec: dc.expires_in,
+      }, signal);
+      throwIfAuthAborted(signal);
+      const cached = tokenResponseToCached(tokens, cfg);
+      await writeTokenCache(cache, cached);
+      throwIfAuthAborted(signal);
+      return cached;
+    })());
+
+    return {
+      url: dc.verification_uri_complete || dc.verification_uri,
+      userCode: dc.user_code,
+      completion,
+      expiresInSec: dc.expires_in,
+    };
+  })());
 }
 
 /**
@@ -313,15 +386,18 @@ async function beginDeviceFlow(opts: { cfg?: OidcConfig; cachePath?: string } = 
  * try to open the browser (best-effort — silently no-ops if unavailable),
  * then poll for the token. Intended for `redash-mcp login`.
  */
-export async function performLogin(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<CachedTokens> {
-  const handle = await beginDeviceFlow(opts);
-  process.stderr.write(
-    `\nDevice authorization required. Open this URL in your browser:\n  ${handle.url}\n\n` +
-    `If the page asks for a code, enter: ${handle.userCode}\n` +
-    `(code expires in ${handle.expiresInSec}s)\n\n`,
-  );
-  openBrowser(handle.url);
-  return handle.completion;
+export function performLogin(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<CachedTokens> {
+  const signal = authAbortController.signal;
+  return trackAuthOperation((async () => {
+    const handle = await beginDeviceFlow(opts, signal);
+    process.stderr.write(
+      `\nDevice authorization required. Open this URL in your browser:\n  ${handle.url}\n\n` +
+      `If the page asks for a code, enter: ${handle.userCode}\n` +
+      `(code expires in ${handle.expiresInSec}s)\n\n`,
+    );
+    openBrowser(handle.url);
+    return handle.completion;
+  })());
 }
 
 interface PendingLogin {
@@ -332,6 +408,46 @@ interface PendingLogin {
 }
 
 let pendingLogin: PendingLogin | null = null;
+let pendingLoginStartup: Promise<PendingLogin> | null = null;
+
+function publicPendingLogin(entry: PendingLogin): { url: string; userCode: string; expiresAt: number } {
+  return { url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt };
+}
+
+function getOrStartPendingLogin(
+  opts: { cfg?: OidcConfig; cachePath?: string } = {},
+): Promise<PendingLogin> {
+  if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
+    return Promise.resolve(pendingLogin);
+  }
+  if (pendingLoginStartup) {
+    return pendingLoginStartup;
+  }
+
+  const signal = authAbortController.signal;
+  const startup = trackAuthOperation((async () => {
+    const handle = await beginDeviceFlow(opts, signal);
+    throwIfAuthAborted(signal);
+    const entry: PendingLogin = {
+      url: handle.url,
+      userCode: handle.userCode,
+      completion: handle.completion,
+      expiresAt: Date.now() + handle.expiresInSec * 1000,
+    };
+    pendingLogin = entry;
+    void handle.completion.then(
+      () => { if (pendingLogin === entry) pendingLogin = null; },
+      () => { if (pendingLogin === entry) pendingLogin = null; },
+    );
+    return entry;
+  })());
+  pendingLoginStartup = startup;
+  void startup.then(
+    () => { if (pendingLoginStartup === startup) pendingLoginStartup = null; },
+    () => { if (pendingLoginStartup === startup) pendingLoginStartup = null; },
+  );
+  return startup;
+}
 
 /**
  * Start (or attach to) a non-interactive device login. The IdP issues a
@@ -343,23 +459,7 @@ let pendingLogin: PendingLogin | null = null;
  * `expiresAt` passes.
  */
 export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<{ url: string; userCode: string; expiresAt: number }> {
-  if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
-    return { url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
-  }
-
-  const handle = await beginDeviceFlow(opts);
-  const entry: PendingLogin = {
-    url: handle.url,
-    userCode: handle.userCode,
-    completion: handle.completion,
-    expiresAt: Date.now() + handle.expiresInSec * 1000,
-  };
-  pendingLogin = entry;
-  handle.completion.finally(() => {
-    if (pendingLogin === entry) pendingLogin = null;
-  }).catch(() => { /* errors surface via the next ensureValidTokens call */ });
-
-  return { url: entry.url, userCode: entry.userCode, expiresAt: entry.expiresAt };
+  return publicPendingLogin(await getOrStartPendingLogin(opts));
 }
 
 /**
@@ -373,25 +473,45 @@ export async function startPendingLogin(opts: { cfg?: OidcConfig; cachePath?: st
  * flow. If no pending flow exists, starts one.
  */
 export async function waitForPendingLogin(opts: { cfg?: OidcConfig; cachePath?: string; timeoutMs?: number } = {}): Promise<CachedTokens> {
+  const signal = authAbortController.signal;
+  throwIfAuthAborted(signal);
   try {
     return await getValidTokens(opts);
   } catch (err) {
+    if (signal.aborted) throw err;
     if (!(err instanceof AuthError)) throw err;
   }
 
-  if (!pendingLogin || pendingLogin.expiresAt <= Date.now()) {
-    await startPendingLogin(opts);
-  }
-  const pl = pendingLogin!;
+  const pl = await getOrStartPendingLogin(opts);
+  throwIfAuthAborted(signal);
   const hardDeadline = pl.expiresAt - Date.now() + 5_000; // device code expiry + small slack
   const timeoutMs = Math.max(0, Math.min(opts.timeoutMs ?? hardDeadline, hardDeadline));
 
-  return await Promise.race([
-    pl.completion,
-    new Promise<CachedTokens>((_, reject) =>
-      setTimeout(() => reject(new AuthError('Timed out waiting for OIDC login. Have the user re-open the verification URL and try again.')), timeoutMs),
-    ),
-  ]);
+  return await new Promise<CachedTokens>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      settle();
+    };
+    const onAbort = () => finish(() => reject(authCancellationError(signal)));
+
+    timer = setTimeout(() => {
+      finish(() => reject(new AuthError('Timed out waiting for OIDC login. Have the user re-open the verification URL and try again.')));
+    }, timeoutMs);
+    signal.addEventListener('abort', onAbort, { once: true });
+    pl.completion.then(
+      (tokens) => finish(() => resolve(tokens)),
+      (error) => finish(() => reject(error)),
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 /**
@@ -404,16 +524,56 @@ export function getPendingLogin(): { url: string; userCode: string; expiresAt: n
   return { url: pendingLogin.url, userCode: pendingLogin.userCode, expiresAt: pendingLogin.expiresAt };
 }
 
+const refreshFlights = new Map<string, Promise<CachedTokens>>();
+
+function refreshFlightKey(cfg: OidcConfig, cache: string): string {
+  return JSON.stringify([cache, cfg.issuer, cfg.clientId, cfg.scopes]);
+}
+
+function refreshAndPersist(
+  cfg: OidcConfig,
+  cache: string,
+  refreshToken: string,
+): Promise<CachedTokens> {
+  const key = refreshFlightKey(cfg, cache);
+  const existing = refreshFlights.get(key);
+  if (existing) return existing;
+
+  const signal = authAbortController.signal;
+  const operation = trackAuthOperation((async () => {
+    const discovery = await discover(cfg.issuer, signal);
+    const refreshed = await refreshTokens(discovery.token_endpoint, {
+      refreshToken,
+      clientId: cfg.clientId,
+      scopes: cfg.scopes,
+    }, signal);
+    throwIfAuthAborted(signal);
+    const updated = tokenResponseToCached(refreshed, cfg, refreshToken);
+    await writeTokenCache(cache, updated);
+    throwIfAuthAborted(signal);
+    return updated;
+  })());
+  refreshFlights.set(key, operation);
+  void operation.then(
+    () => { if (refreshFlights.get(key) === operation) refreshFlights.delete(key); },
+    () => { if (refreshFlights.get(key) === operation) refreshFlights.delete(key); },
+  );
+  return operation;
+}
+
 /**
  * Read the cached tokens and refresh if near expiry. Throws AuthError if no
  * usable cache exists.
  */
 export async function getValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
+  const signal = authAbortController.signal;
+  throwIfAuthAborted(signal);
   const cfg = opts.cfg ?? loadOidcConfig();
   const cache = opts.cachePath ?? tokenCachePath();
   const now = opts.now ?? Date.now;
 
   const cached = await readTokenCache(cache);
+  throwIfAuthAborted(signal);
   if (!cached) {
     throw new AuthError(
       `No cached OIDC tokens at ${cache}. Run \`redash-mcp login\` once in your terminal.`,
@@ -433,15 +593,7 @@ export async function getValidTokens(opts: { cfg?: OidcConfig; cachePath?: strin
     );
   }
 
-  const discovery = await discover(cfg.issuer);
-  const refreshed = await refreshTokens(discovery.token_endpoint, {
-    refreshToken: cached.refreshToken,
-    clientId: cfg.clientId,
-    scopes: cfg.scopes,
-  });
-  const updated = tokenResponseToCached(refreshed, cfg, cached.refreshToken);
-  await writeTokenCache(cache, updated);
-  return updated;
+  return refreshAndPersist(cfg, cache, cached.refreshToken);
 }
 
 /**
@@ -450,22 +602,17 @@ export async function getValidTokens(opts: { cfg?: OidcConfig; cachePath?: strin
  * by the IdP earlier than its stated expiry.
  */
 export async function forceRefresh(opts: { cfg?: OidcConfig; cachePath?: string } = {}): Promise<CachedTokens> {
+  const signal = authAbortController.signal;
+  throwIfAuthAborted(signal);
   const cfg = opts.cfg ?? loadOidcConfig();
   const cache = opts.cachePath ?? tokenCachePath();
 
   const cached = await readTokenCache(cache);
+  throwIfAuthAborted(signal);
   if (!cached?.refreshToken) {
     throw new AuthError('No refresh_token available; run `redash-mcp login` again.');
   }
-  const discovery = await discover(cfg.issuer);
-  const refreshed = await refreshTokens(discovery.token_endpoint, {
-    refreshToken: cached.refreshToken,
-    clientId: cfg.clientId,
-    scopes: cfg.scopes,
-  });
-  const updated = tokenResponseToCached(refreshed, cfg, cached.refreshToken);
-  await writeTokenCache(cache, updated);
-  return updated;
+  return refreshAndPersist(cfg, cache, cached.refreshToken);
 }
 
 /**
@@ -503,12 +650,29 @@ export async function makeLoginRequiredError(
  * call to this function succeeds.
  */
 export async function ensureValidTokens(opts: { cfg?: OidcConfig; cachePath?: string; now?: () => number } = {}): Promise<CachedTokens> {
+  const signal = authAbortController.signal;
   try {
     return await getValidTokens(opts);
   } catch (err) {
+    if (signal.aborted) throw err;
     if (!(err instanceof AuthError)) throw err;
     throw await makeLoginRequiredError('Authorization required to access Redash.', opts);
   }
+}
+
+/** Abort and await all in-flight OIDC discovery, polling, and refresh work. */
+export async function shutdownAuth(): Promise<void> {
+  const controller = authAbortController;
+  const operations = Array.from(activeAuthOperations);
+
+  // Leave this lifecycle aborted so late 401 handlers cannot start fresh auth
+  // work after HTTP shutdown. A newly started server calls initializeAuth().
+  pendingLogin = null;
+  pendingLoginStartup = null;
+  refreshFlights.clear();
+
+  controller.abort(new AuthError('Authentication operation was cancelled during shutdown'));
+  await Promise.allSettled(operations);
 }
 
 export async function performLogout(opts: { cachePath?: string } = {}): Promise<void> {
