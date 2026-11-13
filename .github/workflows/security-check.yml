@@ -4,5 +4,4 @@ on:
 
 jobs:
   security-check:
-    uses: Buzzvil/workflows/.github/workflows/security-check.yaml@main
-    secrets: inherit
+    uses: Buzzvil/workflows/.github/workflows/security-check.yaml@6e111096895852fbd5130b675e5f4d7cd8b31fde
